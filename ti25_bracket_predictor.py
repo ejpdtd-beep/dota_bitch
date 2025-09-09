@@ -44,11 +44,11 @@ UB_QF = [
 
 # Weights & bonuses
 W_RECENT, W_GROUP, W_ROSTER = 0.40, 0.25, 0.15
-W_FORM35 = 0.20              # extra consideration from last-35 stats
+W_FORM35 = 0.05              # extra consideration from last-35 stats
 ROSTER_ISSUES = {"Tundra Esports": True}
-ROSTER_PENALTY = 0.08
+ROSTER_PENALTY = 0.03
 H2H_BOOST = 0.04
-FALCONS_BONUS = 0.02
+FALCONS_BONUS = 0.05
 MAIN_WIN_BONUS = 0.0005      # +0.05% per simulated Main Event win
 
 def parse_input():
