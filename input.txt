@@ -1,3 +1,4 @@
+# Group Win-Loss Records
 Xtreme Gaming: 4-0
 BetBoom Team: 4-1
 Team Tidebound: 4-1
@@ -6,3 +7,9 @@ PARIVISION: 3-2
 Heroic: 3-2
 Nigma Galaxy: 2-3
 Tundra Esports: 2-3
+
+# Head-to-head results (Group Stage)
+Team Falcons > Tundra Esports
+Xtreme Gaming > Team Spirit
+PARIVISION > Nigma Galaxy
+Team Tidebound > Team Liquid
