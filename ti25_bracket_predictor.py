@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-TI2025 bracket predictor using OpenDota last-30 matches + group stage.
+TI2025 Bracket Predictor with Head-to-Head adjustments.
 
 Requirements:
-  pip install requests pandas
+  pip install requests pandas tabulate
 
-Run locally:
+Usage in CI:
   python ti25_bracket_predictor.py < input.txt
-
-Run in GitHub Actions:
-  - Provide group stage W-L in input.txt and pipe as above
-  - Optionally set OPENDOTA_API_KEY secret for higher rate limits
 """
 
 import os
@@ -21,180 +17,133 @@ import pandas as pd
 
 API_BASE = "https://api.opendota.com/api"
 
-# DEFAULT TEAM IDS (verify these at https://www.opendota.com/teams)
 TEAM_IDS = {
-    "Tundra": 8291895,
-    "XG": 8261500,
+    "Tundra Esports": 8291895,
+    "Xtreme Gaming": 8261500,
     "PARIVISION": 9572001,
     "Heroic": 9303484,
-    "TT": 9640842,      # Team Tidebound
-    "FLCN": 9247354,    # Team Falcons
-    "BB": 14124,        # BetBoom Team
-    "NGX": 7554697,     # Nigma Galaxy
+    "Team Tidebound": 9640842,
+    "Team Falcons": 9247354,
+    "BetBoom Team": 14124,
+    "Nigma Galaxy": 7554697,
 }
 
-# Upper bracket round 1 pairs (from your screenshot)
 UB_round1 = [
-    ("XG", "Tundra"),
-    ("PV", "Heroic"),  # alias: PV → PARIVISION
-    ("TT", "FLCN"),
-    ("BB", "NGX"),
+    ("Xtreme Gaming", "Tundra Esports"),
+    ("PARIVISION", "Heroic"),
+    ("Team Tidebound", "Team Falcons"),
+    ("BetBoom Team", "Nigma Galaxy"),
 ]
 
-ALIASES = {"PV": "PARIVISION"}
-
-# Standin / roster issue flags (penalty applied)
 ROSTER_ISSUES = {
-    "Tundra": True,   # Whitemon stand-in note
-    "XG": False,
+    "Tundra Esports": True,
+    "Xtreme Gaming": False,
     "PARIVISION": False,
     "Heroic": False,
-    "TT": False,
-    "FLCN": False,
-    "BB": False,
-    "NGX": False,
+    "Team Tidebound": False,
+    "Team Falcons": False,
+    "BetBoom Team": False,
+    "Nigma Galaxy": False,
 }
 
-# Weighting
 W_RECENT = 0.50
 W_GROUP = 0.30
 W_ROSTER = 0.20
-ROSTER_PENALTY = 0.08  # 8% score reduction
+ROSTER_PENALTY = 0.08  # 8%
+
+H2H_BOOST = 0.05  # 5%
 
 API_KEY = os.environ.get("OPENDOTA_API_KEY")
 HEADERS = {}
 if API_KEY:
     HEADERS['Authorization'] = f"Bearer {API_KEY}"
 
+def parse_input():
+    group_wr = {}
+    h2h = []
+    for line in sys.stdin:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ">" in line:
+            a,b = [x.strip() for x in line.split(">")]
+            h2h.append((a, b, 1))
+        elif "<" in line:
+            a,b = [x.strip() for x in line.split("<")]
+            h2h.append((a, b, -1))
+        elif ":" in line:
+            name, rec = line.split(":",1)
+            w,l = rec.strip().split("-")
+            w, l = int(w), int(l)
+            group_wr[name.strip()] = w / (w + l) if w+l>0 else 0.5
+    return group_wr, h2h
+
 def get_team_matches(team_id, limit=30):
-    """Fetch recent pro matches for a team."""
     url = f"{API_BASE}/teams/{team_id}/matches?limit={limit}"
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def compute_recent_score(matches):
-    """Compute winrate from match list."""
-    wins = 0
-    total = 0
+def compute_recent_wl(matches):
+    wins = total = 0
     for m in matches:
         if 'radiant' in m and 'radiant_win' in m:
             total += 1
-            team_won = (m['radiant'] and m['radiant_win']) or (not m['radiant'] and not m['radiant_win'])
-            if team_won:
-                wins += 1
-    if total == 0:
-        return 0.5
-    return wins / total
+            won = (m['radiant'] and m['radiant_win']) or (not m['radiant'] and not m['radiant_win'])
+            if won: wins += 1
+    return wins / total if total else 0.5
 
-def get_group_stage_winrate_from_input(team_name):
-    """
-    Ask user (or read piped input) for group stage W-L.
-    Example: "4-3" → 4 wins, 3 losses
-    """
-    try:
-        line = input().strip()
-    except EOFError:
-        return 0.5
-    if line == "":
-        return 0.5
-    try:
-        w, l = line.split("-")
-        w, l = int(w), int(l)
-        if w + l == 0:
-            return 0.5
-        return w / (w + l)
-    except:
-        return 0.5
+def team_score(name, group_wr):
+    tid = TEAM_IDS[name]
+    matches = get_team_matches(tid)
+    time.sleep(0.2)
+    recent = compute_recent_wl(matches)
+    gs = group_wr.get(name, 0.5)
+    pen = ROSTER_PENALTY if ROSTER_ISSUES.get(name, False) else 0.0
+    combined = W_RECENT*recent + W_GROUP*gs + W_ROSTER*(1 - pen)
+    return {"team": name, "recent":recent, "group":gs, "penalty":pen, "score":combined}
 
-def team_score(team_key):
-    team_key = ALIASES.get(team_key, team_key)
-    team_id = TEAM_IDS[team_key]
+def apply_h2h(a, b, h2h):
+    boost = 0.0
+    for x,y,res in h2h:
+        if x==a and y==b and res==1:
+            boost = H2H_BOOST
+        elif x==a and y==b and res==-1:
+            boost = -H2H_BOOST
+    return boost
 
-    print(f"Fetching last 30 matches for {team_key} (id {team_id})...")
-    matches = get_team_matches(team_id, limit=30)
-    time.sleep(0.2)  # rate-limit friendly
-    recent_wr = compute_recent_score(matches)
+def win_prob(sa, sb): return 1/(1+math.exp(-8*(sa-sb)))
 
-    gs_wr = get_group_stage_winrate_from_input(team_key)
-
-    roster_pen = ROSTER_PENALTY if ROSTER_ISSUES.get(team_key, False) else 0.0
-
-    combined = (W_RECENT * recent_wr) + (W_GROUP * gs_wr) + (W_ROSTER * (1 - roster_pen))
-
-    return {
-        "team": team_key,
-        "team_id": team_id,
-        "recent_wr": recent_wr,
-        "group_wr": gs_wr,
-        "roster_penalty": roster_pen,
-        "score": combined,
-    }
-
-def win_prob(score_a, score_b):
-    """Convert score diff into probability."""
-    diff = score_a - score_b
-    return 1 / (1 + math.exp(-8 * diff))
-
-def predict_match(a, b, scores):
-    sa = scores[a]["score"]
-    sb = scores[b]["score"]
+def predict(a,b,scores,h2h):
+    sa = scores[a]['score'] + apply_h2h(a,b,h2h)
+    sb = scores[b]['score'] + apply_h2h(b,a,h2h)
     p = win_prob(sa, sb)
-    winner = a if p >= 0.5 else b
-    return {"team_a": a, "team_b": b, "p_a": p, "p_b": 1-p, "winner": winner}
+    return a if p>=0.5 else b, p
+
+import sys
 
 def main():
-    # Collect team scores
-    scores = {}
-    needed_teams = {ALIASES.get(a,a) for pair in UB_round1 for a in pair}
-    for tk in needed_teams:
-        scores[tk] = team_score(tk)
+    group_wr, h2h = parse_input()
+    scores = {t: team_score(t, group_wr) for t in TEAM_IDS}
+    df = pd.DataFrame(scores).T.set_index('team')[['recent','group','penalty','score']]
+    print("\nTEAM SCORES:\n", df.sort_values('score', ascending=False), "\n")
 
-    df = pd.DataFrame(scores).T[["team_id","recent_wr","group_wr","roster_penalty","score"]]
-    print("\nTEAM SCORES:")
-    print(df.sort_values("score", ascending=False).to_string())
-
-    # Predict UB round 1
-    ub_results = []
-    print("\nUB ROUND 1 PREDICTIONS:")
+    results = []
+    print("UB Round 1 Predictions:")
     for a,b in UB_round1:
-        a = ALIASES.get(a,a)
-        b = ALIASES.get(b,b)
-        res = predict_match(a,b,scores)
-        ub_results.append(res)
-        print(f"{a} vs {b} → {res['winner']} (p {res['p_a']:.2f}/{res['p_b']:.2f})")
+        win, p = predict(a,b,scores,h2h)
+        print(f"{a} vs {b} → {win} (p={p:.2f})")
+        results.append((a,b,win,p))
 
-    ub_winners = [r["winner"] for r in ub_results]
-    ub_losers = [r["team_a"] if r["winner"]!=r["team_a"] else r["team_b"] for r in ub_results]
-
-    # UB Semis & Final
-    semis = [predict_match(ub_winners[0],ub_winners[1],scores),
-             predict_match(ub_winners[2],ub_winners[3],scores)]
-    final = predict_match(semis[0]["winner"], semis[1]["winner"], scores)
-
-    # LB round 1 (losers face off, simplified)
-    lb_pairs = [(ub_losers[0],ub_losers[1]), (ub_losers[2],ub_losers[3])]
-    lb_results = [predict_match(a,b,scores) for a,b in lb_pairs]
-
-    # Save Markdown report
+    # Save markdown report
     with open("bracket_prediction.md","w") as f:
         f.write("# TI25 Bracket Prediction\n\n")
         f.write("## Team Scores\n")
-        f.write(df.sort_values("score", ascending=False).to_markdown())
-        f.write("\n\n## Upper Bracket Round 1\n")
-        for r in ub_results:
-            f.write(f"- {r['team_a']} vs {r['team_b']} → **{r['winner']}** "
-                    f"(p {r['p_a']:.2f}/{r['p_b']:.2f})\n")
-        f.write("\n## Upper Bracket Semis\n")
-        for s in semis:
-            f.write(f"- {s['team_a']} vs {s['team_b']} → **{s['winner']}**\n")
-        f.write("\n## Upper Bracket Final\n")
-        f.write(f"- {final['team_a']} vs {final['team_b']} → **{final['winner']}**\n")
-        f.write("\n## Lower Bracket Round 1\n")
-        for r in lb_results:
-            f.write(f"- {r['team_a']} vs {r['team_b']} → **{r['winner']}**\n")
+        f.write(df.sort_values('score',ascending=False).to_markdown())
+        f.write("\n\n## UB Round 1\n")
+        for a,b,win,p in results:
+            f.write(f"- {a} vs {b} → **{win}** (p={p:.2f})\n")
+    print("\nSaved bracket_prediction.md")
 
-    print("\nBracket prediction saved to bracket_prediction.md")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
