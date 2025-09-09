@@ -1,14 +1,13 @@
 name: TI25 Bracket Predictor
 
 on:
-  workflow_dispatch:   # allows manual run
+  workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"   # run daily at 12:00 UTC
+    - cron: "0 12 * * *"   # daily 12:00 UTC
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -21,9 +20,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Build input.txt from Liquipedia (Group Stage)
+        run: python dota_bitch/build_input.py
+
       - name: Run bracket predictor
         env:
-          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}  # optional if you have one
+          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}
         run: python ti25_bracket_predictor.py < input.txt
 
       - name: Upload bracket prediction
