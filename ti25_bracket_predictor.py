@@ -37,8 +37,8 @@ UB1 = [
 ROSTER_ISSUES = {"Tundra Esports": True}
 W_RECENT, W_GROUP, W_ROSTER = 0.5, 0.3, 0.2
 ROSTER_PENALTY = 0.08
-H2H_BOOST = 0.05
-FALCONS_BONUS = 0.09
+H2H_BOOST = 0.04
+FALCONS_BONUS = 0.08
 
 def parse_input():
     group_wr = {}
