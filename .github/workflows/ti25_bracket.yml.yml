@@ -1,0 +1,33 @@
+name: TI25 Bracket Predictor
+
+on:
+  workflow_dispatch:   # allows manual run
+  schedule:
+    - cron: "0 12 * * *"   # run daily at 12:00 UTC
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bracket predictor
+        env:
+          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}  # optional if you have one
+        run: python ti25_bracket_predictor.py < input.txt
+
+      - name: Upload bracket prediction
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti25-bracket
+          path: bracket_prediction.md
