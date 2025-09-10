@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # -----------------------------
 UPSET_BUFFER = 0.55                  # underdog must exceed this to upset
 MAIN_EVENT_PER_WIN = 0.00020         # carry-forward score bump per win
-FALCONS_FAN_BONUS = 0.03             # already halved as per your earlier change
+FALCONS_FAN_BONUS = 0.065            # already halved as per your earlier change
 H2H_UNIT_BONUS = 0.01                # +0.01 per map advantage
 H2H_CLAMP = 0.03                     # cap total H2H swing per opponent to ±0.03
 
