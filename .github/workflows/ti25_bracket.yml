@@ -3,11 +3,12 @@ name: TI25 Bracket Predictor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 12 * * *"   # run daily at 12:00 UTC
 
 jobs:
   predict:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -20,30 +21,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build input.txt from Liquipedia (Group Stage)
-        run: python dota_bitch/build_input.py
-
-      - name: Sanity check files before prediction
+      - name: Build group-stage input (all matchups & H2H)
         run: |
-          echo "Top of predictor:"
-          head -n 5 ti25_bracket_predictor.py || true
+          python dota_bitch/build_input.py
           echo "Input size:"
           wc -l input.txt || true
-          ls -la
 
-      - name: Run bracket predictor
+      - name: Run predictor (creates markdown + images)
         env:
-          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}
-        run: python ti25_bracket_predictor.py < input.txt
-
-      - name: Verify output exists
+          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}  # optional
         run: |
+          python ti25_bracket_predictor.py < input.txt
           test -f bracket_prediction.md
-          ls -lh bracket_prediction.md
+          ls -lh bracket_prediction.md || true
+          ls -lh *.png || true
 
-      - name: Upload bracket prediction
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ti25-bracket
-          path: bracket_prediction.md
+          path: |
+            bracket_prediction.md
+            bracket_scores.png
+            kda_heatmap.png
+            bracket_tree.png
           if-no-files-found: error
