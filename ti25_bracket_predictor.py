@@ -361,9 +361,15 @@ def predict(a,b, scores: Dict[str,dict], h2h, per_win_bonus: Dict[str,float]):
     underdog = b if favorite == a else a
     winner = a if p >= 0.5 else b
 
-    # Upset buffer: if underdog "wins" but p <= UPSET_P_THRESHOLD, give it to favorite
-    if winner == underdog and p <= UPSET_P_THRESHOLD:
-        winner = favorite
+    # Determine winner applying upset buffer logic
+    if p >= 0.5:
+        winner = a
+        if sa < sb and p < UPSET_P_THRESHOLD:  # underdog shouldn't win with low p
+            winner = b
+    else:
+        winner = b
+        if sb < sa and (1.0 - p) < UPSET_P_THRESHOLD:  # underdog shouldn't win with low p
+            winner = a
 
     # revert temp adjustments (we don’t permanently alter base score here)
     scores[a]['score'] -= adj_a
