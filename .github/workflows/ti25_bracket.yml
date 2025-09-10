@@ -3,7 +3,7 @@ name: TI25 Bracket Predictor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"   # run daily at 12:00 UTC
+    - cron: "0 12 * * *"
 
 jobs:
   predict:
@@ -21,15 +21,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build group-stage input (all matchups & H2H)
+      - name: Build input (group stage matchups)
         run: |
           python dota_bitch/build_input.py
           echo "Input size:"
           wc -l input.txt || true
 
-      - name: Run predictor (creates markdown + images)
+      - name: Run predictor
         env:
-          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}  # optional
+          OPENDOTA_API_KEY: ${{ secrets.OPENDOTA_API_KEY }}  # optional, reduces 429s
         run: |
           python ti25_bracket_predictor.py < input.txt
           test -f bracket_prediction.md
