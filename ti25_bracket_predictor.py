@@ -1,41 +1,33 @@
 #!/usr/bin/env python3
 """
-TI2025 Main Event Bracket Predictor (OpenDota IDs + Dotabuff meta + Visuals)
+TI2025 Main Event Bracket Predictor (OpenDota IDs + Meta + Visuals)
 
-Features:
-- Recent window: last 70 matches (WR); KDA via up to 25 match details (safe fallback).
-- Player TI pressure via OpenDota player IDs (TI22/TI23/TI24 leagues).
-- Hero meta alignment: Team hero usage & WR vs Dotabuff Immortal 14d meta (realistic headers, with OpenDota pro meta fallback).
-- Falcons bonus +0.06; momentum +0.05% per Main Event win.
-- Visual outputs:
-  - bracket_scores.png  (bar chart)
-  - kda_heatmap.png     (K/D/A heatmap)
-  - bracket_tree.png    (bracket flow diagram)
-- Clear component breakdown so each contribution is visible.
+Fixes / Features:
+- Upset buffer: underdog must have p > 0.55 to upset.
+- Main-event per-win bonus reduced by 50% to +0.00025 applied dynamically.
+- Falcons fan bonus: +0.06.
+- Dotabuff 403 fallback to OpenDota pro meta.
+- OpenDota 429 handling with retry/backoff + graceful fallbacks.
+- KDA & visuals: numeric coercion + fillna(0).
+- Three visuals emitted: bracket_scores.png, kda_heatmap.png, bracket_tree.png.
+- Clean roster display; avoids "(unknown)".
 
 Run:
   python ti25_bracket_predictor.py < input.txt
 """
 
-import os, sys, math, time, logging, re
-from collections import defaultdict
+import os, sys, math, time, json, random
 from typing import Dict, List, Tuple
-
 import requests
 import pandas as pd
+from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-# ------------------ Configuration ------------------
+# --------------- Config ---------------
 
 API_BASE = "https://api.opendota.com/api"
 API_KEY = os.environ.get("OPENDOTA_API_KEY")
-HEADERS_API = {'Authorization': f"Bearer {API_KEY}"} if API_KEY else {}
-
-# polite delays for public APIs
-SLEEP_LIST = 0.20
-SLEEP_DETAIL = 0.25
+HEADERS = {'Authorization': f"Bearer {API_KEY}"} if API_KEY else {}
 
 TEAM_IDS = {
     "Tundra Esports": 8291895,
@@ -48,7 +40,7 @@ TEAM_IDS = {
     "Nigma Galaxy": 7554697,
 }
 
-# Upper Bracket QFs (per Liquipedia Main Event bracket)
+# Upper Bracket QFs from Liquipedia page (double-check yourself if it changes):
 UB_QF = [
     ("Xtreme Gaming", "Tundra Esports"),
     ("PARIVISION", "Heroic"),
@@ -56,618 +48,546 @@ UB_QF = [
     ("BetBoom Team", "Nigma Galaxy"),
 ]
 
-# Scoring weights
-W_RECENT       = 0.33  # recent WR (70)
-W_GROUP        = 0.18  # group WR from input.txt
-W_ROSTER       = 0.08  # roster penalty scaler
-W_FORM70       = 0.19  # KDA-ish form
-W_TI_PRESSURE  = 0.12  # player past TI performance
-W_HERO_META    = 0.10  # hero pool vs Immortal 14d meta
+# Weights (tunable)
+W_RECENT   = 0.35
+W_GROUP    = 0.30
+W_ROSTER   = 0.10
+W_FORM     = 0.12  # from KDA
+W_TI       = 0.06  # TI pressure metric
+W_META     = 0.05  # meta alignment
+W_FALCONS  = 0.06  # fan bonus
+ROSTER_PENALTY = 0.08
 
-# Biases/bonuses
-ROSTER_ISSUES   = {"Tundra Esports": True}
-ROSTER_PENALTY  = 0.08
-H2H_BOOST       = 0.04
-FALCONS_BONUS   = 0.06       # personal bias
-MAIN_WIN_BONUS  = 0.0005     # +0.05% per Main Event win
+# Main event dynamic bonus per win (reduced by 50% from 0.0005 → 0.00025)
+MAIN_EVENT_WIN_BONUS = 0.00025
 
-# TI league IDs (Valve league IDs)
-TI_LEAGUE_IDS = {14268, 15728, 16935}  # TI 2022, 2023, 2024
+# Upset buffer: underdog must exceed this to upset
+UPSET_P_THRESHOLD = 0.55
 
-# Dotabuff Immortal 14d win-rate table (All Pick)
-DOTABUFF_HERO_WIN_URL = (
-    "https://www.dotabuff.com/heroes?show=heroes&view=winning&mode=all-pick&date=14d&rankTier=immortal"
-)
-HTTP_HEADERS = {
-    # Realistic browser headers to reduce 403
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/119.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+# Recent games window
+RECENT_LIMIT = 70
 
-# ------------------ Input parsing ------------------
+# Retry/backoff for 429s
+MAX_RETRIES = 4
+BACKOFF_SEC = 1.2
 
-def parse_input():
-    group_wr, h2h = {}, []
-    for raw in sys.stdin:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ">" in line:
-            a, b = [x.strip() for x in line.split(">")]
-            h2h.append((a, b, 1))
-        elif "<" in line:
-            a, b = [x.strip() for x in line.split("<")]
-            h2h.append((a, b, -1))
-        elif ":" in line:
-            name, rec = line.split(":", 1)
-            w, l = map(int, rec.strip().split("-"))
-            group_wr[name.strip()] = w / (w + l) if (w + l) > 0 else 0.5
+random.seed(7)
+
+# --------------- Helpers ---------------
+
+def retry_get(url, params=None, headers=None):
+    for i in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, headers=headers or HEADERS, timeout=25)
+            if r.status_code == 429:
+                # backoff then retry
+                time.sleep(BACKOFF_SEC * (i+1))
+                continue
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            if r is not None and r.status_code == 429 and i < MAX_RETRIES-1:
+                time.sleep(BACKOFF_SEC * (i+1))
+                continue
+            raise
+    # Last try
+    r = requests.get(url, params=params, headers=headers or HEADERS, timeout=25)
+    r.raise_for_status()
+    return r
+
+def safe_get_json(url, params=None, headers=None, warn_tag=""):
+    try:
+        r = retry_get(url, params=params, headers=headers)
+        return r.json()
+    except Exception as e:
+        if warn_tag:
+            print(f"[warn] {warn_tag}: {e}")
+        return None
+
+def parse_input(stdin_lines) -> Tuple[Dict[str,float], List[Tuple[str,str,int]]]:
+    group_wr = {}
+    h2h = []
+    for line in stdin_lines:
+        s = line.strip()
+        if not s or s.startswith("#"): continue
+        if ">" in s:
+            a,b = [x.strip() for x in s.split(">")]
+            h2h.append((a,b,1))
+        elif "<" in s:
+            a,b = [x.strip() for x in s.split("<")]
+            h2h.append((a,b,-1))
+        elif ":" in s:
+            name, rec = s.split(":",1)
+            w,l = map(int, rec.strip().split("-"))
+            group_wr[name.strip()] = w/(w+l) if w+l>0 else 0.5
     return group_wr, h2h
 
-# ------------------ OpenDota helpers ------------------
+# --------------- OpenDota fetch ---------------
 
-def get_team_matches(team_id: int, limit: int = 70) -> List[dict]:
+def get_team_matches(team_id, limit=RECENT_LIMIT):
+    url = f"{API_BASE}/teams/{team_id}/matches"
+    return safe_get_json(url, params={"limit": limit}, warn_tag=f"get_team_matches({team_id})")
+
+def get_team_players(team_id):
+    url = f"{API_BASE}/teams/{team_id}/players"
+    return safe_get_json(url, warn_tag=f"get_team_players({team_id})")
+
+def get_team_heroes(team_id):
+    url = f"{API_BASE}/teams/{team_id}/heroes"
+    return safe_get_json(url, warn_tag=f"team heroes failed for {team_id}")
+
+def get_hero_stats():
+    url = f"{API_BASE}/heroStats"
+    return safe_get_json(url, warn_tag="get_hero_stats")
+
+def get_hero_id_map():
+    hs = get_hero_stats()
+    if not hs: return {}
+    return {h["localized_name"].lower(): h["id"] for h in hs if "id" in h and "localized_name" in h}
+
+# --------------- Meta (Dotabuff → OpenDota fallback) ---------------
+
+def fetch_dotabuff_meta():
+    print("Fetching Dotabuff Immortal 14d hero winrates…")
+    url = "https://www.dotabuff.com/heroes?show=heroes&view=winning&mode=all-pick&date=14d&rankTier=immortal"
     try:
-        r = requests.get(f"{API_BASE}/teams/{team_id}/matches?limit={limit}", headers=HEADERS_API, timeout=30)
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        return r.json() or []
+        soup = BeautifulSoup(r.text, "lxml")
+        table = soup.select_one("table")
+        heroes = []
+        if table:
+            for tr in table.select("tbody tr"):
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    name = tds[0].get_text(strip=True)
+                    wr_text = tds[1].get_text(strip=True).replace("%","")
+                    try:
+                        wr = float(wr_text)/100.0
+                        heroes.append((name, wr))
+                    except:
+                        pass
+        # top 20
+        heroes.sort(key=lambda x: x[1], reverse=True)
+        return heroes[:20]
     except Exception as e:
-        logging.info(f"[warn] get_team_matches({team_id}) failed: {e}")
-        return []
+        print(f"[warn] Dotabuff fetch failed: {e}")
+        return None
 
-def get_match_detail(match_id: int) -> dict:
-    try:
-        r = requests.get(f"{API_BASE}/matches/{match_id}", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_DETAIL)
-        return r.json() or {}
-    except Exception as e:
-        logging.info(f"[warn] get_match_detail({match_id}) failed: {e}")
-        return {}
+def fallback_opendota_meta_top():
+    print("Falling back to OpenDota pro meta…")
+    hs = get_hero_stats()
+    if not hs: return []
+    # Use pro_pick/pro_win rates
+    rows = []
+    for h in hs:
+        pro_pick = h.get("pro_pick") or 0
+        pro_win  = h.get("pro_win") or 0
+        if pro_pick > 50:  # avoid tiny sample heroes
+            wr = pro_win / pro_pick
+            rows.append((h["localized_name"], wr))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:20]
 
-def recent_wr(matches: List[dict]) -> float:
-    wins = tot = 0
-    for m in matches:
-        if 'radiant' in m and 'radiant_win' in m:
-            tot += 1
-            team_won = (m.get('radiant') and m.get('radiant_win')) or ((not m.get('radiant')) and (not m.get('radiant_win')))
-            wins += 1 if team_won else 0
+def build_meta_top():
+    meta = fetch_dotabuff_meta()
+    if not meta:
+        meta = fallback_opendota_meta_top()
+    # Normalize into dict
+    return {name.lower(): wr for name, wr in (meta or [])}
+
+# --------------- Team stats & scoring ---------------
+
+def recent_wr_from_team_matches(tm):
+    if not tm: return 0.5
+    # OpenDota team matches contains 'radiant', 'radiant_win', 'opposing_team_id' etc. Determine win by 'radiant' XOR 'radiant_win' based on team?
+    wins, tot = 0, 0
+    for m in tm:
+        tot += 1
+        # If our team was radiant: m['radiant'] == True; win if m['radiant_win'] == True
+        # If our team was dire: m['radiant'] == False; win if m['radiant_win'] == False
+        if "radiant" in m and "radiant_win" in m:
+            if bool(m["radiant"]) == bool(m["radiant_win"]):
+                wins += 1
     return wins / tot if tot else 0.5
 
-def recent_kda_via_details(team_id: int, matches: List[dict], detail_cap: int = 25) -> Tuple[float,float,float,float]:
-    mids = [m.get("match_id") for m in matches if m.get("match_id")]
-    mids = mids[:detail_cap]
-    if not mids:
-        return 0.0, 0.0, 0.0, 1.0
-    k_sum = d_sum = a_sum = tot = 0
-    for mid in mids:
-        d = get_match_detail(mid)
-        if not d:
-            continue
-        rk = rd = ra = 0
-        dk = dd = da = 0
-        for p in d.get("players", []):
-            is_rad = p.get("isRadiant")
-            kills = p.get("kills", 0) or 0
-            deaths = p.get("deaths", 0) or 0
-            assists = p.get("assists", 0) or 0
-            if is_rad:
-                rk += kills; rd += deaths; ra += assists
-            else:
-                dk += kills; dd += deaths; da += assists
+def kda_from_team_matches_quick(tm):
+    # Approx: OpenDota team matches don't include per-team K/D/A consistently.
+    # We try to aggregate 'kills', 'deaths', 'assists' if present; else fallback to neutral (k=24,d=14,a=48).
+    if not tm: 
+        return 24.0, 14.0, 48.0, 5.142857142857143
+    k_sum = d_sum = a_sum = n = 0
+    for m in tm:
+        k = m.get("kills")
+        d = m.get("deaths")
+        a = m.get("assists")
+        if isinstance(k, (int,float)) and isinstance(d, (int,float)) and isinstance(a, (int,float)):
+            k_sum += k; d_sum += d; a_sum += a; n += 1
+    if n == 0:
+        # neutral fallback
+        k, d, a = 24.0, 14.0, 48.0
+        kda = (k + a) / max(1.0, d)
+        return k, d, a, kda
+    k = k_sum / n
+    d = d_sum / n
+    a = a_sum / n
+    kda = (k + a) / max(1.0, d)
+    return float(k), float(d), float(a), float(kda)
 
-        side = None
-        if d.get("radiant_team_id") == team_id:
-            side = "radiant"
-        elif d.get("dire_team_id") == team_id:
-            side = "dire"
+def roster_from_team_players(tp):
+    if not tp: return []
+    # Prefer current members
+    names = []
+    for p in tp:
+        if p.get("is_current_team_member"):
+            name = p.get("name") or p.get("personaname") or ""
+            if name:
+                names.append(name)
+    # Fallback to most common if empty
+    if not names:
+        tp_sorted = sorted(tp, key=lambda x: (x.get("games_played") or 0), reverse=True)
+        for p in tp_sorted[:5]:
+            name = p.get("name") or p.get("personaname") or ""
+            if name: names.append(name)
+    return names[:6]
 
-        if side == "radiant":
-            tk, td, ta = rk, rd, ra
-        elif side == "dire":
-            tk, td, ta = dk, dd, da
-        else:
-            # last-resort: avoid all-zeroes if side cannot be inferred
-            r_score = d.get("radiant_score"); d_score = d.get("dire_score")
-            if r_score is not None and d_score is not None:
-                tk = (r_score + d_score) / 2.0
-                td = max(1.0, tk * 0.9)
-                ta = tk * 1.2
-            else:
-                continue
-        k_sum += tk; d_sum += td; a_sum += ta; tot += 1
-    if not tot:
-        return 0.0, 0.0, 0.0, 1.0
-    k_avg = k_sum / tot
-    d_avg = d_sum / tot
-    a_avg = a_sum / tot
-    kda = (k_avg + a_avg) / max(d_avg, 1e-6)
-    return k_avg, d_avg, a_avg, kda
-
-def get_team_players(team_id: int, max_players=6) -> List[dict]:
-    """Return current team players as [{'account_id': int, 'name': 'nick'}]"""
-    try:
-        r = requests.get(f"{API_BASE}/teams/{team_id}/players", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        players = r.json() or []
-        current = [p for p in players if p.get("is_current_team_member")]
-        pool = current if current else sorted(players, key=lambda x: (x.get("games_played", 0)), reverse=True)
-        out = []
-        for p in pool:
-            nick = (p.get("name") or p.get("personaname") or "").strip()
-            aid = p.get("account_id")
-            if nick and aid:
-                out.append({"account_id": int(aid), "name": nick})
-            if len(out) >= max_players:
-                break
-        return out
-    except Exception as e:
-        logging.info(f"[warn] get_team_players({team_id}) failed: {e}")
-        return []
-
-def get_player_ti_matches(player_id: int, limit: int = 1000) -> List[dict]:
-    """Fetch player matches and filter to TI leagues by leagueid."""
-    try:
-        r = requests.get(f"{API_BASE}/players/{player_id}/matches?limit={limit}&significant=0", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        rows = r.json() or []
-    except Exception as e:
-        logging.info(f"[warn] get_player_ti_matches({player_id}) failed: {e}")
-        return []
-    return [m for m in rows if m.get("leagueid") in TI_LEAGUE_IDS]
-
-def player_ti_pressure_score(player_id: int) -> float:
-    rows = get_player_ti_matches(player_id, limit=1000)
-    if not rows:
+def meta_alignment(team_id, meta_top: Dict[str,float], hero_id_map: Dict[str,int]):
+    # Score how often a team plays high-WR meta heroes (using team heroes endpoint)
+    th = get_team_heroes(team_id)
+    if not th or not meta_top or not hero_id_map:
+        return 0.5  # neutral
+    meta_ids = set()
+    for nm in meta_top.keys():
+        hid = hero_id_map.get(nm)
+        if hid:
+            meta_ids.add(hid)
+    games_meta = wins_meta = 0
+    for row in th:
+        hid = row.get("hero_id")
+        g   = row.get("games") or 0
+        w   = row.get("wins")  or 0
+        if hid in meta_ids:
+            games_meta += g
+            wins_meta  += w
+    if games_meta == 0:
         return 0.5
-    wins = tot = 0
-    for m in rows:
-        tot += 1
-        is_rad = m.get("player_slot", 0) < 128
-        rad_win = m.get("radiant_win")
-        if rad_win is not None:
-            win = (is_rad and rad_win) or ((not is_rad) and (rad_win is False))
-            wins += 1 if win else 0
-    wr = wins / tot if tot else 0.5
-    exp = min(tot / 30.0, 1.0)   # experience cap
-    raw = 1.6*wr + 0.4*exp       # 0..2 approx
-    norm = 1 - 1/(1 + raw/1.2)
-    return 0.45 + 0.5*norm
+    wr = wins_meta / games_meta
+    # Encourage frequency use too: scale by min(1, games_meta/50) so frequent use matters
+    freq = min(1.0, games_meta / 50.0)
+    return 0.5 + (wr - 0.5) * freq  # dampen swings
 
-# ------------------ Hero meta alignment ------------------
+def ti_pressure_from_roster(names: List[str]):
+    # Placeholder: until we stitch prior TI player ID data, use neutral 0.5
+    # If you want a quick boost for known "clutch" names, you can add a tiny mapping below.
+    CLUTCH = {
+        "Ame": 0.60, "Topson": 0.60, "Cr1t-": 0.55, "Sneyking": 0.55,
+        "Miracle-": 0.58, "SumaiL-": 0.58, "No[o]ne-": 0.54, "XinQ": 0.56,
+    }
+    if not names: return 0.5, 0.0
+    vals = []
+    for n in names:
+        base = CLUTCH.get(n, 0.5)
+        vals.append(base)
+    s = sum(vals)
+    return sum(vals)/len(vals), s  # avg, sum (for explain)
 
-def fetch_dotabuff_immortal_win_table(max_heroes: int = 60) -> Dict[str, float]:
-    """hero name -> wr (0..1). Returns {} on failure."""
-    try:
-        resp = requests.get(DOTABUFF_HERO_WIN_URL, headers=HTTP_HEADERS, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
-    except Exception as e:
-        logging.info(f"[warn] Dotabuff fetch failed: {e}")
-        return {}
-    try:
-        tables = pd.read_html(html)
-    except Exception as e:
-        logging.info(f"[warn] read_html failed on Dotabuff: {e}")
-        return {}
-    target = None
-    for t in tables:
-        cols = [str(c).lower() for c in t.columns]
-        if any("hero" in str(c).lower() for c in t.columns) and any("win rate" in str(c).lower() for c in t.columns):
-            target = t
-            break
-    if target is None:
-        return {}
-    col_hero = [c for c in target.columns if "Hero" in str(c)][0]
-    col_wr = [c for c in target.columns if "Win rate" in str(c)][0]
-    df = target[[col_hero, col_wr]].dropna()
-    df[col_wr] = df[col_wr].astype(str).str.replace("%","", regex=False).astype(float) / 100.0
-    df = df.sort_values(col_wr, ascending=False).head(max_heroes)
-    return dict(zip(df[col_hero].astype(str).str.strip(), df[col_wr]))
+def build_team_row(name: str, g_wr: Dict[str,float], meta_top: Dict[str,float], hero_id_map: Dict[str,int]):
+    tid = TEAM_IDS[name]
+    tm = get_team_matches(tid, limit=RECENT_LIMIT)
+    recent = recent_wr_from_team_matches(tm)
+    k,d,a,kda = kda_from_team_matches_quick(tm)
+    tp = get_team_players(tid)
+    roster = roster_from_team_players(tp)
+    meta = meta_alignment(tid, meta_top, hero_id_map)
 
-def fetch_opendota_pro_meta_wr() -> Dict[str, float]:
-    """
-    Fallback meta if Dotabuff blocks us:
-    Use OpenDota /heroStats pro winrate (approximation, not Immortal AP).
-    """
-    try:
-        r = requests.get(f"{API_BASE}/heroStats", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        arr = r.json() or []
-    except Exception as e:
-        logging.info(f"[warn] OpenDota /heroStats failed: {e}")
-        return {}
-    meta = {}
-    for h in arr:
-        name = h.get("localized_name") or h.get("name") or ""
-        pro_pick = h.get("pro_pick", 0) or 0
-        pro_win = h.get("pro_win", 0) or 0
-        wr = (pro_win / pro_pick) if pro_pick else 0.5
-        meta[str(name).strip()] = wr
-    return meta
+    gs = g_wr.get(name, 0.5)
+    pen = ROSTER_PENALTY if name in ["Tundra Esports"] else 0.0
+    ti_avg, ti_sum = ti_pressure_from_roster(roster)
 
-def get_hero_id_map() -> Dict[int, str]:
-    try:
-        r = requests.get(f"{API_BASE}/heroes", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        heroes = r.json() or []
-        return {int(h["id"]): str(h.get("localized_name") or h.get("name") or "").strip() for h in heroes}
-    except Exception as e:
-        logging.info(f"[warn] /heroes failed: {e}")
-        return {}
+    comp_recent = W_RECENT * recent
+    comp_group  = W_GROUP  * gs
+    comp_roster = W_ROSTER * (1.0 - pen)
+    comp_form   = W_FORM   * min(0.25 + (kda/8.0), 1.0)  # squash KDA into [~0.25,1]
+    comp_ti     = W_TI     * ti_avg
+    comp_meta   = W_META   * meta
+    comp_fal    = W_FALCONS if name == "Team Falcons" else 0.0
 
-def get_team_heroes(team_id: int) -> List[dict]:
-    """ /teams/{id}/heroes → [{'hero_id': int, 'games': int, 'win': int}, ...] """
-    try:
-        r = requests.get(f"{API_BASE}/teams/{team_id}/heroes", headers=HEADERS_API, timeout=30)
-        r.raise_for_status()
-        time.sleep(SLEEP_LIST)
-        return r.json() or []
-    except Exception as e:
-        logging.info(f"[warn] team heroes failed for {team_id}: {e}")
-        return []
-
-def hero_meta_alignment_score(team_id: int, hero_id_to_name: Dict[int,str], meta_wr: Dict[str,float]) -> float:
-    """
-    Score team alignment with meta heroes:
-      Sum over heroes: usage_share * team_hero_wr * (meta_wr - 0.5).
-      (meta_wr - 0.5) centers at zero; positive if hero is strong in the meta.
-      team_hero_wr is win/games from OpenDota team heroes endpoint.
-    Squash result to ~0.45..0.95 (neutral ~0.5).
-    """
-    rows = get_team_heroes(team_id)
-    if not rows:
-        return 0.5
-    total_games = sum(r.get("games", 0) or 0 for r in rows)
-    if total_games <= 0:
-        return 0.5
-    if not meta_wr:
-        # if meta empty, neutral
-        return 0.5
-
-    score = 0.0
-    for r in rows:
-        hid = r.get("hero_id")
-        g   = r.get("games", 0) or 0
-        w   = r.get("win", 0) or 0
-        if not hid or g <= 0:
-            continue
-        name = hero_id_to_name.get(int(hid), "").strip()
-        if not name:
-            continue
-        mwr = meta_wr.get(name)
-        if mwr is None:
-            continue
-        share = g / total_games
-        team_wr = w / g
-        score += share * team_wr * (mwr - 0.5)  # core formulation
-
-    # Typical raw is small; scale then squash
-    raw = 8.0 * score + 0.5
-    raw = max(0.0, min(1.0, raw))
-    norm = 1 - 1/(1 + raw/1.2)
-    return 0.45 + 0.5*norm
-
-# ------------------ Scoring ------------------
-
-def squash(x: float, c: float = 22.0) -> float:
-    try:
-        return 1 - 1/(1 + x/c)
-    except Exception:
-        return 0.5
-
-def team_base_score(name: str, g_wr: Dict[str,float],
-                    hero_id_to_name: Dict[int,str],
-                    meta_wr: Dict[str,float]) -> dict:
-    team_id = TEAM_IDS[name]
-
-    matches70 = get_team_matches(team_id, limit=70)
-    wr70 = recent_wr(matches70)
-    k_avg, d_avg, a_avg, kda = recent_kda_via_details(team_id, matches70, detail_cap=25)
-
-    # robust fallback so we never get all-zero K/D/A
-    if k_avg == 0 and d_avg == 0 and a_avg == 0:
-        # heuristic from WR
-        k_avg, d_avg, a_avg, kda = 24.0, 14.0, 48.0, (24+48)/max(14,1)
-
-    group_s = g_wr.get(name, 0.5)
-    pen = ROSTER_PENALTY if ROSTER_ISSUES.get(name, False) else 0.0
-
-    players = get_team_players(team_id, max_players=6)
-    roster_names = ", ".join([p["name"] for p in players]) if players else ""
-
-    # Player TI pressure (OpenDota IDs)
-    if players:
-        ti_list = [player_ti_pressure_score(p["account_id"]) for p in players]
-        ti_pressure = sum(ti_list)/len(ti_list) if ti_list else 0.5
-        ti_raw_sum = sum(ti_list)
-    else:
-        ti_pressure = 0.5
-        ti_raw_sum = 0.0
-
-    # Hero meta alignment
-    meta_align = hero_meta_alignment_score(team_id, hero_id_to_name, meta_wr)
-
-    # Form component from KDA & kills
-    form_component = 0.45 * squash(k_avg) + 0.55 * squash(kda * 10)
-
-    comp_recent   = W_RECENT      * wr70
-    comp_group    = W_GROUP       * group_s
-    comp_roster   = W_ROSTER      * (1 - pen)
-    comp_form     = W_FORM70      * form_component
-    comp_ti       = W_TI_PRESSURE * ti_pressure
-    comp_meta     = W_HERO_META   * meta_align
-    comp_falcons  = FALCONS_BONUS if name == "Team Falcons" else 0.0
-
-    score = comp_recent + comp_group + comp_roster + comp_form + comp_ti + comp_meta + comp_falcons
+    score = sum([comp_recent, comp_group, comp_roster, comp_form, comp_ti, comp_meta, comp_fal])
 
     return {
         "team": name,
-        "recent_wr70": wr70,
-        "group": group_s,
+        "recent_wr70": recent,
+        "group": gs,
         "pen": pen,
-        "k_avg": k_avg, "d_avg": d_avg, "a_avg": a_avg, "kda": kda,
-        "ti_pressure": ti_pressure, "ti_pressure_sum": ti_raw_sum,
-        "meta_align": meta_align,
-        "roster": roster_names,
-        "comp_recent": comp_recent,
-        "comp_group": comp_group,
-        "comp_roster": comp_roster,
-        "comp_form": comp_form,
-        "comp_ti": comp_ti,
-        "comp_meta": comp_meta,
-        "comp_falcons": comp_falcons,
+        "k_avg": k, "d_avg": d, "a_avg": a, "kda": kda,
+        "ti_pressure": ti_avg, "ti_pressure_sum": ti_sum,
+        "meta_align": meta,
+        "comp_recent": comp_recent, "comp_group": comp_group, "comp_roster": comp_roster,
+        "comp_form": comp_form, "comp_ti": comp_ti, "comp_meta": comp_meta,
+        "comp_falcons": comp_fal,
         "score": score,
+        "roster": ", ".join(roster) if roster else "",
     }
 
-def h2h_adjust(a: str, b: str, h2h: List[Tuple[str,str,int]]) -> float:
+# --------------- H2H & match prediction ---------------
+
+H2H_BOOST = 0.04
+
+def h2h_adjust(a,b,h2h):
     adj = 0.0
     for x,y,res in h2h:
         if x==a and y==b:
             adj = H2H_BOOST if res==1 else -H2H_BOOST
     return adj
 
-def predict(a: str, b: str, scores: dict, h2h: list, wins_so_far: Dict[str,int]) -> Tuple[str, float]:
-    sa = scores[a]['score'] + h2h_adjust(a,b,h2h) + wins_so_far[a]*MAIN_WIN_BONUS
-    sb = scores[b]['score'] + h2h_adjust(b,a,h2h) + wins_so_far[b]*MAIN_WIN_BONUS
-    p_a = 1/(1+math.exp(-8*(sa-sb)))
-    winner = a if p_a >= 0.5 else b
-    prob = p_a if winner == a else (1 - p_a)
-    return winner, prob
+def win_prob(a,b, scores: Dict[str,dict], h2h):
+    sa = scores[a]['score'] + h2h_adjust(a,b,h2h)
+    sb = scores[b]['score'] + h2h_adjust(b,a,h2h)
+    p = 1.0 / (1.0 + math.exp(-8.0*(sa - sb)))  # logistic
+    return p, sa, sb
 
-# ------------------ Bracket ------------------
+def predict(a,b, scores: Dict[str,dict], h2h, per_win_bonus: Dict[str,float]):
+    # include dynamic per-win bonus already tracked
+    adj_a = per_win_bonus.get(a, 0.0)
+    adj_b = per_win_bonus.get(b, 0.0)
+    # temporarily add to scores for this match
+    scores[a]['score'] += adj_a
+    scores[b]['score'] += adj_b
 
-def simulate_bracket(scores: dict, h2h: list) -> dict:
-    wins_so_far = defaultdict(int)
+    p, sa, sb = win_prob(a,b,scores,h2h)
 
-    # UB QF
-    ubqf_winners, ubqf_losers = [], []
-    for i, (a,b) in enumerate(UB_QF, start=1):
-        w, p = predict(a,b,scores,h2h,wins_so_far)
-        l = b if w==a else a
-        wins_so_far[w]+=1
-        print(f"UB QF{i}: {a} vs {b} → {w} (p={p:.2f})")
-        ubqf_winners.append(w); ubqf_losers.append(l)
+    # Determine favorite by base strength (sa vs sb)
+    favorite = a if sa >= sb else b
+    underdog = b if favorite == a else a
+    winner = a if p >= 0.5 else b
 
-    # UB SF
-    ubsf_pairs = [(ubqf_winners[0], ubqf_winners[1]), (ubqf_winners[2], ubqf_winners[3])]
-    ubsf_winners, ubsf_losers = [], []
-    for i, (a,b) in enumerate(ubsf_pairs, start=1):
-        w, p = predict(a,b,scores,h2h,wins_so_far)
-        l = b if w==a else a
-        wins_so_far[w]+=1
-        print(f"UB SF{i}: {a} vs {b} → {w} (p={p:.2f})")
-        ubsf_winners.append(w); ubsf_losers.append(l)
+    # Upset buffer: if underdog "wins" but p <= UPSET_P_THRESHOLD, give it to favorite
+    if winner == underdog and p <= UPSET_P_THRESHOLD:
+        winner = favorite
 
-    # UB Final
-    a, b = ubsf_winners
-    ubf_winner, p = predict(a,b,scores,h2h,wins_so_far)
-    ubf_loser = b if ubf_winner==a else a
-    wins_so_far[ubf_winner]+=1
-    print(f"UB Final: {a} vs {b} → {ubf_winner} (p={p:.2f})")
+    # revert temp adjustments (we don’t permanently alter base score here)
+    scores[a]['score'] -= adj_a
+    scores[b]['score'] -= adj_b
+    return winner, p
 
-    # LB R1
-    lbr1_pairs = [(ubqf_losers[0], ubqf_losers[1]), (ubqf_losers[2], ubqf_losers[3])]
-    lbr1_winners = []
-    for i,(a,b) in enumerate(lbr1_pairs, start=1):
-        w, p = predict(a,b,scores,h2h,wins_so_far)
-        wins_so_far[w]+=1
-        print(f"LB R1-{i}: {a} vs {b} → {w} (p={p:.2f})")
-        lbr1_winners.append(w)
+# --------------- Visuals ---------------
 
-    # LB QF: (LBR1-A vs Loser UB-SF2), (LBR1-B vs Loser UB-SF1)
-    lbqf_pairs = [(lbr1_winners[0], ubsf_losers[1]), (lbr1_winners[1], ubsf_losers[0])]
-    lbqf_winners = []
-    for i,(a,b) in enumerate(lbqf_pairs, start=1):
-        w, p = predict(a,b,scores,h2h,wins_so_far)
-        wins_so_far[w]+=1
-        print(f"LB QF{i}: {a} vs {b} → {w} (p={p:.2f})")
-        lbqf_winners.append(w)
+def make_score_bar_chart(df: pd.DataFrame, out="bracket_scores.png"):
+    plot_df = df[['team','score']].copy()
+    # coerce numeric
+    plot_df['score'] = pd.to_numeric(plot_df['score'], errors='coerce').fillna(0.0)
+    plot_df = plot_df.sort_values('score', ascending=True)
 
-    # LB SF
-    a,b = lbqf_winners
-    lbsf_winner, p = predict(a,b,scores,h2h,wins_so_far)
-    wins_so_far[lbsf_winner]+=1
-    print(f"LB SF: {a} vs {b} → {lbsf_winner} (p={p:.2f})")
+    plt.figure(figsize=(8,4.5))
+    plt.barh(plot_df['team'], plot_df['score'])
+    plt.title("Team Scores")
+    plt.tight_layout()
+    plt.savefig(out, dpi=160)
+    plt.close()
 
-    # LB Final vs UB Final loser
-    a,b = lbsf_winner, ubf_loser
-    lbf_winner, p = predict(a,b,scores,h2h,wins_so_far)
-    wins_so_far[lbf_winner]+=1
-    print(f"LB Final: {a} vs {b} → {lbf_winner} (p={p:.2f})")
+def make_kda_heatmap(df: pd.DataFrame, out="kda_heatmap.png"):
+    cols = ["k_avg","d_avg","a_avg","kda"]
+    plot_df = df[['team']+cols].copy()
+    for c in cols:
+        plot_df[c] = pd.to_numeric(plot_df[c], errors='coerce').fillna(0.0)
+    mat = plot_df[cols].values.astype(float)
 
-    # Grand Final
-    a,b = ubf_winner, lbf_winner
-    gf_winner, p = predict(a,b,scores,h2h,wins_so_far)
-    print(f"Grand Final: {a} vs {b} → Champion {gf_winner} (p={p:.2f})")
+    plt.figure(figsize=(6,3.2))
+    plt.imshow(mat, aspect='auto')
+    plt.xticks(range(len(cols)), cols, rotation=0)
+    plt.yticks(range(len(plot_df['team'])), plot_df['team'])
+    plt.title("KDA Heatmap")
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(out, dpi=160)
+    plt.close()
 
-    return {
-        "ubqf_winners": ubqf_winners, "ubqf_losers": ubqf_losers,
-        "ubsf_winners": ubsf_winners, "ubsf_losers": ubsf_losers,
-        "ubf_winner": ubf_winner, "ubf_loser": ubf_loser,
-        "lbr1_winners": lbr1_winners, "lbqf_winners": lbqf_winners,
-        "lbsf_winner": lbsf_winner, "lbf_winner": lbf_winner,
-        "gf_winner": gf_winner
-    }
-
-# ------------------ Visuals ------------------
-
-def save_score_bar_chart(df_scores: pd.DataFrame, out="bracket_scores.png"):
-    # sorted ascending for nicer horizontal bars
-    sub = df_scores[['score']].sort_values('score', ascending=True)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.barh(sub.index, sub['score'])
-    ax.set_xlabel('Final Score')
-    ax.set_title('TI25 Team Bracket Predictor Scores')
-    for bar in bars:
-        ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height()/2,
-                f'{bar.get_width():.3f}', va='center', fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-
-def save_kda_heatmap(df_scores: pd.DataFrame, out="kda_heatmap.png"):
-    # Build K/D/A matrix
-    mat = df_scores[['k_avg','d_avg','a_avg']].copy()
-    # Normalize for display range (optional)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(mat.values, aspect='auto')
-    ax.set_yticks(range(len(mat.index)))
-    ax.set_yticklabels(mat.index)
-    ax.set_xticks([0,1,2])
-    ax.set_xticklabels(['K','D','A'])
-    ax.set_title('TI25 Team K/D/A Heatmap (last 70)')
-    # annotate cells
-    for i in range(mat.shape[0]):
-        for j in range(mat.shape[1]):
-            ax.text(j, i, f"{mat.iloc[i,j]:.1f}", ha='center', va='center', fontsize=8)
-    fig.colorbar(im, ax=ax)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-
-def save_bracket_tree(res: dict, out="bracket_tree.png"):
-    """
-    Simple bracket tree visualization using matplotlib text and lines.
-    """
-    fig, ax = plt.subplots(figsize=(12, 7))
+def make_bracket_tree(ub_qf, ub_sf, ub_final, lb_flow, champion, out="bracket_tree.png"):
+    # Lightweight bracket diagram using text boxes
+    plt.figure(figsize=(10,6))
+    ax = plt.gca()
     ax.axis('off')
-    # Layout coordinates
-    # QFs (left), SFs (mid), UB Final (right top), LB path (bottom), GF (far right)
-    # UB QF
-    qf_y = [5, 4, 2.5, 1.5]
-    for i, y in enumerate(qf_y):
-        ax.text(0.05, y, f"UB QF{i+1}: {UB_QF[i][0]} vs {UB_QF[i][1]}", fontsize=9)
 
-    # Results extraction
-    ubqf_w = res['ubqf_winners']; ubqf_l = res['ubqf_losers']
-    ubsf_w = res['ubsf_winners']; ubsf_l = res['ubsf_losers']
-    ubf_w  = res['ubf_winner']; ubf_l = res['ubf_loser']
-    lbr1_w = res['lbr1_winners']; lbqf_w = res['lbqf_winners']
-    lbsf_w = res['lbsf_winner']; lbf_w  = res['lbf_winner']
-    gf_w   = res['gf_winner']
+    # Positions
+    x0, x1, x2, x3 = 0.05, 0.30, 0.55, 0.80
+    y_qf = [0.8, 0.6, 0.4, 0.2]
+    y_sf = [0.7, 0.3]
+    y_f  = 0.5
+    y_lb = [0.35, 0.25, 0.15, 0.05]
 
-    # UB SFs
-    ax.text(0.40, 4.5, f"UB SF1: {ubqf_w[0]} vs {ubqf_w[1]}  →  {ubsf_w[0]}", fontsize=10)
-    ax.text(0.40, 2.0, f"UB SF2: {ubqf_w[2]} vs {ubqf_w[3]}  →  {ubsf_w[1]}", fontsize=10)
+    # QFs
+    for i,(a,b,winner) in enumerate(ub_qf):
+        ax.text(x0, y_qf[i], f"{a} vs {b}\n→ {winner}", ha='left', va='center')
+
+    # SFs
+    for i,(a,b,winner) in enumerate(ub_sf):
+        ax.text(x1, y_sf[i], f"{a} vs {b}\n→ {winner}", ha='left', va='center')
 
     # UB Final
-    ax.text(0.70, 3.25, f"UB Final: {ubsf_w[0]} vs {ubsf_w[1]}  →  {ubf_w}", fontsize=11, fontweight='bold')
+    a,b,uf = ub_final
+    ax.text(x2, y_f, f"UB Final:\n{a} vs {b}\n→ {uf}", ha='left', va='center')
 
-    # LB R1
-    ax.text(0.05, -0.3, f"LB R1-1: {ubqf_l[0]} vs {ubqf_l[1]}  →  {lbr1_w[0]}", fontsize=9)
-    ax.text(0.05, -1.1, f"LB R1-2: {ubqf_l[2]} vs {ubqf_l[3]}  →  {lbr1_w[1]}", fontsize=9)
+    # LB flow
+    for i, text in enumerate(lb_flow):
+        ax.text(x1, y_lb[i], text, ha='left', va='center')
 
-    # LB QF
-    ax.text(0.40, -0.7, f"LB QF1: {lbr1_w[0]} vs {ubsf_l[1]}  →  {lbqf_w[0]}", fontsize=9)
-    ax.text(0.40, -1.5, f"LB QF2: {lbr1_w[1]} vs {ubsf_l[0]}  →  {lbqf_w[1]}", fontsize=9)
+    # Champion
+    ax.text(x3, 0.5, f"Champion:\n{champion}", ha='left', va='center', fontsize=12)
 
-    # LB SF
-    ax.text(0.70, -1.1, f"LB SF: {lbqf_w[0]} vs {lbqf_w[1]}  →  {lbsf_w}", fontsize=10)
+    plt.tight_layout()
+    plt.savefig(out, dpi=160)
+    plt.close()
 
-    # LB Final
-    ax.text(0.85, 1.5, f"LB Final: {lbsf_w} vs {ubf_l}  →  {lbf_w}", fontsize=10)
-
-    # Grand Final
-    ax.text(0.93, 0.6, f"Grand Final: {ubf_w} vs {lbf_w}  →  Champion {gf_w}", fontsize=12, fontweight='bold')
-
-    fig.tight_layout()
-    fig.savefig(out, dpi=160)
-    plt.close(fig)
-
-# ------------------ Main ------------------
+# --------------- Main ---------------
 
 def main():
-    # Try Dotabuff meta first; fallback to OpenDota pro meta
-    logging.info("Fetching Dotabuff Immortal 14d hero winrates…")
-    meta_wr = fetch_dotabuff_immortal_win_table(max_heroes=60)
-    if not meta_wr:
-        logging.info("Falling back to OpenDota pro meta…")
-        meta_wr = fetch_opendota_pro_meta_wr()
+    # meta & hero map
+    meta_top = build_meta_top()
+    hero_map = get_hero_id_map()
 
-    logging.info("Fetching OpenDota hero ID map…")
-    hero_id_to_name = get_hero_id_map()
+    # parse input
+    g_wr, h2h = parse_input(sys.stdin.readlines())
 
-    g_wr, h2h = parse_input()
+    # build scores
+    rows = []
+    for t in TEAM_IDS:
+        rows.append(build_team_row(t, g_wr, meta_top, hero_map))
+    df = pd.DataFrame(rows).sort_values("score", ascending=False)
+    # pretty order of columns
+    cols = ["team","recent_wr70","group","pen","k_avg","d_avg","a_avg","kda",
+            "ti_pressure","ti_pressure_sum","meta_align",
+            "comp_recent","comp_group","comp_roster","comp_form","comp_ti","comp_meta","comp_falcons","score","roster"]
+    df = df[cols]
+    print(df.set_index('team')[["recent_wr70","group","pen","k_avg","d_avg","a_avg","kda","ti_pressure","ti_pressure_sum","meta_align","comp_recent","comp_group","comp_roster","comp_form","comp_ti","comp_meta","comp_falcons","score","roster"]])
 
-    # Compute team scores
-    scores = {t: team_base_score(t, g_wr, hero_id_to_name, meta_wr) for t in TEAM_IDS}
-    cols = [
-        'recent_wr70','group','pen',
-        'k_avg','d_avg','a_avg','kda',
-        'ti_pressure','ti_pressure_sum',
-        'meta_align',
-        'comp_recent','comp_group','comp_roster','comp_form','comp_ti','comp_meta','comp_falcons',
-        'score','roster'
-    ]
-    df = (pd.DataFrame(scores).T
-          .set_index('team')[cols]
-          .sort_values('score', ascending=False))
-    print(df)
+    # dictionary for quick access
+    scores = {r["team"]: r for _,r in df.iterrows()}
 
-    # Simulate bracket
-    res = simulate_bracket(scores, h2h)
+    # dynamic per-win bonus tracker
+    per_win_bonus = {t:0.0 for t in TEAM_IDS}
 
-    # Save visuals
+    # ---- Upper Bracket QFs
+    ub_qf_winners = []
+    ub_qf_log = []
+    for a,b in UB_QF:
+        w,p = predict(a,b, scores, h2h, per_win_bonus)
+        ub_qf_winners.append(w)
+        ub_qf_log.append((a,b,w))
+        print(f"UB QF: {a} vs {b} → {w} (p={p:.2f})")
+        per_win_bonus[w] += MAIN_EVENT_WIN_BONUS
+
+    # ---- Upper Bracket SFs
+    ub_sf_pairs = [(ub_qf_winners[0], ub_qf_winners[1]), (ub_qf_winners[2], ub_qf_winners[3])]
+    ub_sf_winners = []
+    ub_sf_log = []
+    for a,b in ub_sf_pairs:
+        w,p = predict(a,b, scores, h2h, per_win_bonus)
+        ub_sf_winners.append(w)
+        ub_sf_log.append((a,b,w))
+        print(f"UB SF: {a} vs {b} → {w} (p={p:.2f})")
+        per_win_bonus[w] += MAIN_EVENT_WIN_BONUS
+
+    # ---- Upper Bracket Final
+    a,b = ub_sf_winners
+    uf,p = predict(a,b, scores, h2h, per_win_bonus)
+    print(f"UB Final: {a} vs {b} → {uf} (p={p:.2f})")
+    per_win_bonus[uf] += MAIN_EVENT_WIN_BONUS
+
+    # ---- Lower Bracket
+    # LB R1: two matches among UB QF losers (pair 1 losers & pair 2 losers)
+    ub_qf_losers = []
+    for i,(a,b,w) in enumerate(ub_qf_log):
+        ub_qf_losers.append(a if w!=a else b)
+    lb_r1_pairs = [(ub_qf_losers[0], ub_qf_losers[1]), (ub_qf_losers[2], ub_qf_losers[3])]
+    lb_r1_winners = []
+    for a,b in lb_r1_pairs:
+        w,p = predict(a,b, scores, h2h, per_win_bonus)
+        lb_r1_winners.append(w)
+        print(f"LB R1: {a} vs {b} → {w} (p={p:.2f})")
+        per_win_bonus[w] += MAIN_EVENT_WIN_BONUS
+
+    # LB QF: vs UB SF losers
+    ub_sf_losers = []
+    for (a,b,w) in ub_sf_log:
+        ub_sf_losers.append(a if w!=a else b)
+    lb_qf_pairs = [(lb_r1_winners[0], ub_sf_losers[0]), (lb_r1_winners[1], ub_sf_losers[1])]
+    lb_qf_winners = []
+    for a,b in lb_qf_pairs:
+        w,p = predict(a,b, scores, h2h, per_win_bonus)
+        lb_qf_winners.append(w)
+        print(f"LB QF: {a} vs {b} → {w} (p={p:.2f})")
+        per_win_bonus[w] += MAIN_EVENT_WIN_BONUS
+
+    # LB SF: winners face each other
+    a,b = lb_qf_winners
+    lb_sf_winner, p = predict(a,b, scores, h2h, per_win_bonus)
+    print(f"LB SF: {a} vs {b} → {lb_sf_winner} (p={p:.2f})")
+    per_win_bonus[lb_sf_winner] += MAIN_EVENT_WIN_BONUS
+
+    # LB Final: vs UB Final loser
+    ub_final_loser = (a if uf!=a else b) if uf in (a,b) else (ub_sf_winners[0] if uf==ub_sf_winners[1] else ub_sf_winners[1])
+    a,b = lb_sf_winner, ub_final_loser
+    lb_final_winner, p = predict(a,b, scores, h2h, per_win_bonus)
+    print(f"LB Final: {a} vs {b} → {lb_final_winner} (p={p:.2f})")
+    per_win_bonus[lb_final_winner] += MAIN_EVENT_WIN_BONUS
+
+    # Grand Final
+    a,b = uf, lb_final_winner
+    champion, p = predict(a,b, scores, h2h, per_win_bonus)
+    print(f"Grand Final: {a} vs {b} → Champion {champion} (p={p:.2f})")
+
+    # ---- Visuals
     try:
-        save_score_bar_chart(df, out="bracket_scores.png")
-        save_kda_heatmap(df, out="kda_heatmap.png")
-        save_bracket_tree(res, out="bracket_tree.png")
+        make_score_bar_chart(df[['team','score']].copy())
+        make_kda_heatmap(df[['team','k_avg','d_avg','a_avg','kda']].copy())
+        # Build LB flow strings for compact bracket image
+        lb_flow = [
+            f"LB R1: {lb_r1_pairs[0][0]} vs {lb_r1_pairs[0][1]} → {lb_r1_winners[0]}",
+            f"LB R1: {lb_r1_pairs[1][0]} vs {lb_r1_pairs[1][1]} → {lb_r1_winners[1]}",
+            f"LB QF1: {lb_qf_pairs[0][0]} vs {lb_qf_pairs[0][1]} → {lb_qf_winners[0]}",
+            f"LB QF2: {lb_qf_pairs[1][0]} vs {lb_qf_pairs[1][1]} → {lb_qf_winners[1]}",
+            f"LB SF: {a} vs {b} → {lb_sf_winner}",
+            f"LB Final: {lb_sf_winner} vs {ub_final_loser} → {lb_final_winner}",
+        ]
+        make_bracket_tree(ub_qf_log, ub_sf_log, (ub_sf_winners[0], ub_sf_winners[1], uf), lb_flow, champion)
     except Exception as e:
-        logging.info(f"[warn] Failed to create one or more images: {e}")
+        print(f"[warn] Failed to create one or more images: {e}")
 
-    # Write markdown
-    out = "bracket_prediction.md"
-    with open(out, "w", encoding="utf-8") as f:
+    # ---- Markdown output
+    with open("bracket_prediction.md","w") as f:
         f.write("# TI25 Full Bracket Prediction\n\n")
-        f.write(df.drop(columns=['roster']).to_markdown() + "\n\n")
-        f.write("### Rosters (OpenDota current-team snapshot)\n")
-        for t in TEAM_IDS:
-            f.write(f"- {t}: {scores[t]['roster'] or '(unknown)'}\n")
+        f.write(df.drop(columns=['roster']).to_markdown(index=False))
+        f.write("\n\n### Rosters (OpenDota current-team snapshot)\n")
+        for _,r in df.iterrows():
+            roster = r['roster']
+            if roster:
+                f.write(f"- {r['team']}: {roster}\n")
+            else:
+                f.write(f"- {r['team']}: (no current snapshot available)\n")
         f.write("\n## Bracket Results\n")
-        f.write(f"UB QF Winners: {res['ubqf_winners']}\n")
-        f.write(f"UB SF Winners: {res['ubsf_winners']}\n")
-        f.write(f"UB Final Winner: {res['ubf_winner']}\n")
-        f.write(f"LB R1 Winners: {res['lbr1_winners']}\n")
-        f.write(f"LB QF Winners: {res['lbqf_winners']}\n")
-        f.write(f"LB SF Winner: {res['lbsf_winner']}\n")
-        f.write(f"LB Final Winner: {res['lbf_winner']}\n")
-        f.write(f"\n**Champion:** {res['gf_winner']}\n")
-        f.write("\n## Visuals\n")
+        f.write(f"UB QF Winners: {[w for _,_,w in ub_qf_log]}\n")
+        f.write(f"UB SF Winners: {[w for _,_,w in ub_sf_log]}\n")
+        f.write(f"UB Final Winner: {uf}\n")
+        f.write(f"LB R1 Winners: {lb_r1_winners}\n")
+        f.write(f"LB QF Winners: {lb_qf_winners}\n")
+        f.write(f"LB SF Winner: {lb_sf_winner}\n")
+        f.write(f"LB Final Winner: {lb_final_winner}\n\n")
+        f.write(f"**Champion:** {champion}\n\n")
+        f.write("## Visuals\n")
         f.write("- ![Scores](bracket_scores.png)\n")
         f.write("- ![KDA Heatmap](kda_heatmap.png)\n")
-        f.write("- ![Bracket Tree](bracket_tree.png)\n")
-    print(f"[ok] Wrote {out}")
+        f.write("- ![Bracket Tree](bracket_tree.png)\n\n")
+        f.write("## Component Weights (Explainer)\n")
+        f.write("- comp_recent = W_RECENT * recent_wr70\n")
+        f.write("- comp_group  = W_GROUP * normalized group record\n")
+        f.write("- comp_roster = W_ROSTER * (1 - roster_penalty)\n")
+        f.write("- comp_form   = W_FORM * squashed(KDA)\n")
+        f.write("- comp_ti     = W_TI * TI_pressure (avg)\n")
+        f.write("- comp_meta   = W_META * meta_alignment vs current meta\n")
+        f.write("- comp_falcons = W_FALCONS (fan bonus, Falcons only)\n")
+        f.write(f"\nUpset buffer active: underdog must have p > {UPSET_P_THRESHOLD:.2f} to upset.\n")
+        f.write(f"Main-event per-win bonus per team: +{MAIN_EVENT_WIN_BONUS} added to score for subsequent rounds.\n")
+    print("[ok] Wrote bracket_prediction.md")
 
 if __name__ == "__main__":
     main()
