@@ -2,47 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-TI25 Bracket Predictor — Real data + tie-breakers + per-round outputs + visuals
+TI25 Bracket Predictor — real data + tie-breakers + close-match regen + per-round CSV + visuals
+Now robust to inputs like "Team Tidebound: 4-1" or "(3-2)" — names are sanitized & fuzzily mapped.
 
-What this script does:
-- Pulls real team data from OpenDota (recent form, rosters, meta)
-- Derives group-stage winrates and head-to-head within a date window (Road to TI GS)
-- Computes composite scores using your weights (incl. Falcons fan bonus @ 50% of former)
-- Enforces upset buffer: underdog must have p > 0.55 to upset
-- Auto-regenerates (bootstrap noise) when a matchup is too close
-- Exports match-by-match probabilities and component scores to CSV
-- Produces three visuals: score bar chart, KDA heatmap, and bracket tree
-
-Inputs:
-- Reads optional stdin with  "TEAM_A vs TEAM_B" style lines to seed bracket order (fallback to fixed example order)
-
-Environment:
-- OPENDOTA_API_KEY      : optional (prevents 429 rate limits)
-- GROUP_START_DATE      : YYYY-MM-DD (group stage start)
-- GROUP_END_DATE        : YYYY-MM-DD (group stage end)
-
-Outputs:
-- bracket_prediction.md
-- bracket_scores.png
-- kda_heatmap.png
-- bracket_tree.png
-- bracket_rounds.csv
-
+Features kept:
+- Real data (OpenDota): recent form (70), K/D/A, rosters, group-stage window WR, H2H in window
+- Weights: group performance, H2H via tie-breakers (GS WR → H2H → recent → TI pressure), meta (light), roster continuity, KDA, TI pressure
+- Falcons fan bonus (HALVED), upset buffer, per-win bonus = 0.00020
+- Close-match auto-regeneration with light bootstrap noise
+- Visuals: bar (scores), heatmap (KDA), bracket tree
+- CSV: per match rounds
 """
 
-import os
-import sys
-import math
-import time
-import json
-import random
-import textwrap
-import itertools
-from collections import defaultdict, namedtuple
+import os, sys, re, math, time, random, itertools
 from datetime import datetime, timedelta
+from collections import defaultdict, namedtuple
+
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import networkx as nx
 
@@ -53,50 +31,41 @@ RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
-# ---- Weights (kept from your previous logic, Falcons bonus halved) ----
+# ---- Weights (as previously, Falcons bonus halved) ----
 W_RECENT   = 0.30     # recent 70 games WR
 W_GROUP    = 0.30     # normalized group performance
-W_ROSTER   = 0.10     # roster continuity/penalty inverted
-W_FORM     = 0.10     # squashed KDA
-W_TI       = 0.03     # TI pressure / stage prep
+W_ROSTER   = 0.10     # roster continuity (penalty inverted)
+W_FORM     = 0.10     # squashed KDA component
+W_TI       = 0.03     # TI pressure / prep
 W_META     = 0.025    # meta alignment
-W_FALCONS  = 0.03     # was 0.06, cut by 50%
+W_FALCONS  = 0.03     # was 0.06 → 50% reduction
 
-# Main-event per-win bonus (your request)
+# Per-win bonus (your requested value)
 MAIN_EVENT_WIN_BONUS = 0.00020
 
-# Upset buffer: underdog must have probability > this to upset
-UPSET_BUFFER = 0.55
+# Upset logic
+UPSET_BUFFER = 0.55       # underdog must have p > 0.55 to upset
+CLOSE_MARGIN = 0.010      # absolute score diff threshold
+REGENERATIONS = 7         # number of bootstrap samples when close
+NOISE_STD = 0.006         # jitter scale for close matches
 
-# "Too close" threshold (absolute score diff)
-CLOSE_MARGIN = 0.010
-
-# Number of bootstrap regenerations if close
-REGENERATIONS = 7
-NOISE_STD = 0.006    # light noise to components when "close"
-
-# OpenDota endpoints
 OD_BASE = "https://api.opendota.com/api"
+TODAY = datetime.utcnow()
 
-# Group stage window
 def _date_env(name, default_dt):
     v = os.getenv(name, "")
     if not v:
         return default_dt
     return datetime.strptime(v, "%Y-%m-%d")
 
-TODAY = datetime.utcnow().date()
-DEFAULT_START = (datetime.utcnow() - timedelta(days=30))
-DEFAULT_END = datetime.utcnow()
-
-GROUP_START = _date_env("GROUP_START_DATE", DEFAULT_START)
-GROUP_END   = _date_env("GROUP_END_DATE", DEFAULT_END)
+# Default to last 30 days if not pinned to Road-to-TI GS
+GROUP_START = _date_env("GROUP_START_DATE", TODAY - timedelta(days=30))
+GROUP_END   = _date_env("GROUP_END_DATE", TODAY)
 
 OD_HEADERS = {}
 if os.getenv("OPENDOTA_API_KEY"):
     OD_HEADERS["Authorization"] = f"Bearer {os.getenv('OPENDOTA_API_KEY')}"
 
-# Simple rate-limit/backoff wrapper
 def get_json(url, params=None, retries=4, backoff=0.8):
     for i in range(retries):
         try:
@@ -107,12 +76,81 @@ def get_json(url, params=None, retries=4, backoff=0.8):
             if i == retries - 1:
                 print(f"[warn] GET {url} failed: {e}", flush=True)
                 return None
-            sleep_s = backoff * (2 ** i)
-            time.sleep(sleep_s)
+            time.sleep(backoff * (2 ** i))
     return None
 
 # -----------------------------
-# Helpers to fetch team info
+# Input sanitization & mapping
+# -----------------------------
+RE_TRAILING_RECORD = re.compile(r'\s*(?:[:\-–]\s*|\(\s*)\d+\s*-\s*\d+\s*\)?\s*$', re.UNICODE)
+
+def sanitize_team_name(s: str) -> str:
+    """
+    Remove trailing record annotations like ': 4-1', '- 3-2', or '(2-3)'.
+    Also trims whitespace.
+    """
+    s = s.strip()
+    s = RE_TRAILING_RECORD.sub('', s)
+    return s.strip()
+
+def canonicalize(s: str) -> str:
+    s = sanitize_team_name(s)
+    s = s.replace("’", "'").replace("`", "'")
+    s = re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+    return s
+
+def get_team_id_map():
+    data = get_json(f"{OD_BASE}/teams") or []
+    return { (t.get("name") or "").strip(): int(t["team_id"]) for t in data if t.get("team_id") }
+
+def build_canonical_maps():
+    """
+    Build:
+      - canon_to_id: canonical name -> team_id
+      - canon_to_official: canonical name -> official OpenDota name
+    Adds with/without 'team ' prefix for robustness.
+    """
+    raw = get_team_id_map()
+    canon_to_id = {}
+    canon_to_official = {}
+    for official, tid in raw.items():
+        c = canonicalize(official)
+        if c:
+            canon_to_id[c] = tid
+            canon_to_official[c] = official
+        # also add without/with 'team ' prefix
+        if c.startswith("team "):
+            alt = c.replace("team ", "", 1).strip()
+            if alt and alt not in canon_to_id:
+                canon_to_id[alt] = tid
+                canon_to_official[alt] = official
+        else:
+            alt = ("team " + c).strip()
+            if alt not in canon_to_id:
+                canon_to_id[alt] = tid
+                canon_to_official[alt] = official
+    return canon_to_id, canon_to_official
+
+def best_match_id(canon: str, canon_to_id: dict) -> int | None:
+    """
+    Exact match first; else simple token-overlap (Jaccard) fuzzy match.
+    """
+    if canon in canon_to_id:
+        return canon_to_id[canon]
+    toks = set(canon.split())
+    best, best_s = None, 0.0
+    for k, tid in canon_to_id.items():
+        kt = set(k.split())
+        score = len(toks & kt) / max(1, len(toks | kt))
+        if score > best_s:
+            best, best_s = tid, score
+    return best if best_s >= 0.5 else None
+
+def pretty_official(canon: str, canon_to_official: dict, fallback: str) -> str:
+    return canon_to_official.get(canon) or sanitize_team_name(fallback)
+
+# -----------------------------
+# Team data & metrics
 # -----------------------------
 TeamInfo = namedtuple("TeamInfo", [
     "name",
@@ -133,48 +171,25 @@ def safe_div(a, b, default=0.0):
         return default
 
 def squash_kda(k, d, a):
-    # Prevent div by zero, “heavier” assist credit, light cap
     d = max(d, 1e-6)
     kda = (k + 0.7*a) / d
     return min(kda, 15.0)
 
 def ti_pressure_stub(team_name):
-    # keep similar shape as your logs: average and sum
-    # This can be swapped with actual stage stats if you have them.
-    # Here we softly scale with recent WR so top teams gain a tiny edge.
     return (0.5 + 0.05*np.random.rand(), round(2.5 + 0.7*np.random.rand(), 2))
 
 def meta_alignment_stub(team_name):
-    # Align hero picks to current meta (replace with true OpenDota hero usage vs pro WR if desired)
     return 0.5 + 0.02*np.random.randn()
 
 def roster_penalty_from_movements(roster_list):
-    # light penalty if more than 5 (noise) or unknown roster
     if not roster_list:
         return 0.10
     uniq = len(set(roster_list))
     return max(0.0, min(0.15, 0.02 * (6 - min(6, uniq))))
 
-def get_team_id_map():
-    # Pulls top teams list and builds name → id
-    data = get_json(f"{OD_BASE}/teams")
-    name_to_id = {}
-    if data:
-        for t in data:
-            nm = (t.get("name") or "").strip()
-            tid = t.get("team_id")
-            if nm and tid:
-                name_to_id[nm] = int(tid)
-    return name_to_id
-
 def current_roster(team_id):
-    # OpenDota doesn't always have a clean "current roster". Use /teams/{id}/players + filter recent.
-    players = get_json(f"{OD_BASE}/teams/{team_id}/players")
-    if not players:
-        return []
-    # sort by games played in last 90 days
-    cutoff = datetime.utcnow() - timedelta(days=90)
-    cutoff_ts = int(cutoff.timestamp())
+    players = get_json(f"{OD_BASE}/teams/{team_id}/players") or []
+    cutoff_ts = int((datetime.utcnow() - timedelta(days=90)).timestamp())
     core = [p for p in players if (p.get("is_current_team_member") or (p.get("last_match_time") and p["last_match_time"] >= cutoff_ts))]
     names = []
     for p in sorted(core, key=lambda x: x.get("games_played", 0), reverse=True)[:6]:
@@ -183,116 +198,95 @@ def current_roster(team_id):
     return names
 
 def recent_wr_70(team_id):
-    # Use /teams/{id}/matches limited count
-    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":70})
-    if not matches:
-        return 0.5
-    wins = sum(1 for m in matches if m.get("radiant") and m.get("radiant_win") and m.get("radiant_team_id")==team_id or
-               (not m.get("radiant") and not m.get("radiant_win") and m.get("dire_team_id")==team_id))
-    total = len(matches)
+    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":70}) or []
+    wins = 0; total = 0
+    for m in matches:
+        rt = m.get("radiant_team_id")
+        dt = m.get("dire_team_id")
+        rad = m.get("radiant")
+        rw = m.get("radiant_win")
+        if rt == team_id:
+            total += 1; wins += 1 if rw else 0
+        elif dt == team_id:
+            total += 1; wins += 0 if rw else 1
     return safe_div(wins, total, 0.5)
 
 def kda_block_from_recent(team_id):
-    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":70})
-    if not matches:
-        return (24,14,48,5.14286)  # your prior default block
-    k = d = a = 0
-    n = 0
+    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":70}) or []
+    k=d=a=n=0
     for m in matches:
         if m.get("radiant_team_id")==team_id:
-            k += m.get("radiant_kills",0); d += m.get("radiant_deaths",0); a += m.get("radiant_assists",0)
-            n += 1
+            k += m.get("radiant_kills",0); d += m.get("radiant_deaths",0); a += m.get("radiant_assists",0); n+=1
         elif m.get("dire_team_id")==team_id:
-            k += m.get("dire_kills",0); d += m.get("dire_deaths",0); a += m.get("dire_assists",0)
-            n += 1
-    if n==0: 
-        return (24,14,48,5.14286)
+            k += m.get("dire_kills",0); d += m.get("dire_deaths",0); a += m.get("dire_assists",0); n+=1
+    if n==0: return (24,14,48,5.14286)
     k/=n; d/=n; a/=n
     return (k,d,a,squash_kda(k,d,a))
 
 def group_stage_wr(team_id, start_dt, end_dt):
-    # compute win-rate in time window (Road to TI groups)
-    start_ts = int(start_dt.timestamp())
-    end_ts   = int(end_dt.timestamp())
-    # We’ll page a little to reduce 429s
-    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":100})
-    if not matches:
-        return 0.5
-    wins = 0; total = 0
+    start_ts = int(start_dt.timestamp()); end_ts = int(end_dt.timestamp())
+    matches = get_json(f"{OD_BASE}/teams/{team_id}/matches", params={"limit":200}) or []
+    wins=0; total=0
     for m in matches:
-        mt = m.get("start_time")
-        if not mt: 
-            continue
-        if not (start_ts <= mt <= end_ts):
-            continue
-        is_radiant_team = m.get("radiant_team_id")==team_id
-        did_win = (m.get("radiant_win") and is_radiant_team) or ((not m.get("radiant_win")) and (m.get("dire_team_id")==team_id))
-        wins += 1 if did_win else 0
-        total += 1
-    if total==0:
-        return 0.5
-    return wins/total
+        mt = m.get("start_time"); 
+        if not mt or not (start_ts <= mt <= end_ts): continue
+        rt = m.get("radiant_team_id"); dt = m.get("dire_team_id"); rw = m.get("radiant_win")
+        if rt == team_id:
+            total += 1; wins += 1 if rw else 0
+        elif dt == team_id:
+            total += 1; wins += 0 if rw else 1
+    return safe_div(wins, total, 0.5)
 
 def head_to_head_in_window(team_a_id, team_b_id, start_dt, end_dt):
-    # approximate with A's matches filtered to vs B in window
-    start_ts = int(start_dt.timestamp())
-    end_ts   = int(end_dt.timestamp())
+    start_ts = int(start_dt.timestamp()); end_ts = int(end_dt.timestamp())
     a_matches = get_json(f"{OD_BASE}/teams/{team_a_id}/matches", params={"limit":200}) or []
     wins=0; total=0
     for m in a_matches:
         t = m.get("start_time")
-        if not t or not (start_ts <= t <= end_ts):
-            continue
-        if m.get("opposing_team_id")==team_b_id:
+        if not t or not (start_ts <= t <= end_ts): continue
+        if m.get("opposing_team_id") == team_b_id:
             total += 1
-            is_radiant_team = m.get("radiant_team_id")==team_a_id
-            did_win = (m.get("radiant_win") and is_radiant_team) or ((not m.get("radiant_win")) and (m.get("dire_team_id")==team_a_id))
-            if did_win: wins += 1
+            rt = m.get("radiant_team_id"); dt = m.get("dire_team_id"); rw = m.get("radiant_win")
+            if rt == team_a_id:
+                wins += 1 if rw else 0
+            elif dt == team_a_id:
+                wins += 0 if rw else 1
     return wins, total
 
 def meta_alignment_from_pro_meta():
-    # Very light proxy: take current hero stats and average pro WR; use as flat factor to keep feature structure.
-    # You can expand this to map each team hero use vs global WR to get a true alignment.
-    data = get_json(f"{OD_BASE}/heroStats")
-    if not data:
-        return {}
-    global_wr = np.mean([safe_div(h.get("pro_win",0), max(1,h.get("pro_pick",1))) for h in data])
-    return {"_global_pro_wr": float(global_wr)}
+    data = get_json(f"{OD_BASE}/heroStats") or []
+    vals = []
+    for h in data:
+        pick = max(1, h.get("pro_pick", 1))
+        vals.append(safe_div(h.get("pro_win",0), pick, 0.5))
+    return {"_global_pro_wr": float(np.mean(vals)) if vals else 0.5}
 
-def team_infos(team_names):
-    name_to_id = get_team_id_map()
+def team_infos(team_display_names, canon_to_id, canon_to_official):
     meta = meta_alignment_from_pro_meta()
     infos = {}
-    for nm in team_names:
-        tid = name_to_id.get(nm)
+    for disp in team_display_names:
+        canon = canonicalize(disp)
+        tid = best_match_id(canon, canon_to_id)
+        official = pretty_official(canon, canon_to_official, disp)
+
         if not tid:
-            # allow manual mapping fallback
-            tid = name_to_id.get(nm.replace("Team ","").strip(), None)
-        if not tid:
-            # last resort
-            print(f"[warn] Missing team_id for {nm}; filling defaults.", flush=True)
+            print(f"[warn] Missing team_id for '{disp}' → using defaults (check spelling).", flush=True)
             k,d,a,kda = (24,14,48,5.14286)
-            infos[nm] = TeamInfo(
-                nm, 0.5, 0.6, 0.05, k,d,a,kda, 0.5, 2.5, 0.5, []
-            )
+            infos[official] = TeamInfo(official, 0.5, 0.6, 0.05, k,d,a,kda, 0.5, 2.5, 0.5, [])
             continue
 
         rec = recent_wr_70(tid)
         k,d,a,kda = kda_block_from_recent(tid)
         roster = current_roster(tid)
-
         grp = group_stage_wr(tid, GROUP_START, GROUP_END)
-        grp_norm = min(1.0, max(0.0, grp))  # already 0..1
-
-        ti_p, ti_sum = ti_pressure_stub(nm)
-        meta_align = (meta.get("_global_pro_wr", 0.5) or 0.5)  # neutralized (team-diff is mostly in recent/h2h/group)
+        grp_norm = float(np.clip(grp, 0.0, 1.0))
+        ti_p, ti_sum = ti_pressure_stub(official)
+        meta_align = meta.get("_global_pro_wr", 0.5)
         roster_pen = roster_penalty_from_movements(roster)
 
-        infos[nm] = TeamInfo(
-            nm,
-            rec,
-            grp_norm,
-            roster_pen,
+        infos[official] = TeamInfo(
+            official,
+            rec, grp_norm, roster_pen,
             k,d,a,kda,
             ti_p, ti_sum,
             meta_align,
@@ -327,53 +321,46 @@ def composite_score(team: TeamInfo):
     }
     return float(score), parts
 
-def logistic(x):
-    return 1.0 / (1.0 + math.exp(-x))
+def logistic(x): return 1.0 / (1.0 + math.exp(-x))
 
 def match_probability(score_a, score_b, scale=0.08):
-    # Convert score delta to win probability
     delta = (score_a - score_b) / max(1e-6, scale)
-    p = logistic(delta)
-    return float(p)
+    return float(logistic(delta))
 
 # -----------------------------
-# Tie-breakers
+# Tie-breakers & close regen
 # -----------------------------
-def choose_with_tiebreakers(a_name, b_name, infos, name_to_id, base_pa, allow_upset=True, close_meta=None):
+def choose_with_tiebreakers(a_name, b_name, infos, name_to_id, base_pa, allow_upset=True):
     a = infos[a_name]; b = infos[b_name]
     score_a, _ = composite_score(a)
     score_b, _ = composite_score(b)
 
-    # Favorite by raw score:
     favorite = a_name if score_a >= score_b else b_name
     underdog = b_name if favorite == a_name else a_name
     favored_prob = base_pa if favorite == a_name else 1.0 - base_pa
     underdog_prob = 1.0 - favored_prob
 
-    reason = "score"
-
-    # Upset buffer gate
+    # Upset buffer
     if allow_upset and underdog_prob > UPSET_BUFFER:
-        # allow model prob to dictate
         winner = a_name if base_pa >= 0.5 else b_name
         reason = "model_prob_upset_ok"
     else:
         winner = favorite
+        reason = "score"
 
-    # If still extremely close, apply tiered tiebreakers:
+    # Tiebreakers if very close
     if abs(score_a - score_b) < CLOSE_MARGIN:
         reason = "tiebreakers"
-        # 1) Group-stage WR
         gid = name_to_id.get(a_name); hid = name_to_id.get(b_name)
-        ag = a.group_norm; bg = b.group_norm
-        if abs(ag - bg) > 1e-6:
-            winner = a_name if ag > bg else b_name
+
+        # 1) Group stage WR
+        if abs(a.group_norm - b.group_norm) > 1e-6:
+            winner = a_name if a.group_norm > b.group_norm else b_name
         else:
-            # 2) Head-to-head in window
+            # 2) H2H in window
             if gid and hid:
                 a_w, a_tot = head_to_head_in_window(gid, hid, GROUP_START, GROUP_END)
                 b_w, b_tot = head_to_head_in_window(hid, gid, GROUP_START, GROUP_END)
-                # (a_w vs b) vs (b_w vs a) should be complements; just compare a_w and b_w
                 if (a_tot + b_tot) > 0 and a_w != b_w:
                     winner = a_name if a_w > b_w else b_name
                 else:
@@ -381,22 +368,15 @@ def choose_with_tiebreakers(a_name, b_name, infos, name_to_id, base_pa, allow_up
                     if abs(a.recent_wr70 - b.recent_wr70) > 1e-6:
                         winner = a_name if a.recent_wr70 > b.recent_wr70 else b_name
                     else:
-                        # 4) TI pressure slight nudge
+                        # 4) TI pressure
                         if abs(a.ti_pressure - b.ti_pressure) > 1e-6:
                             winner = a_name if a.ti_pressure > b.ti_pressure else b_name
                         else:
-                            winner = favorite  # final fallback
+                            winner = favorite
 
-    # Probability for the selected winner (per our logistic)
-    pa = base_pa
-    if winner == b_name:
-        pa = 1.0 - base_pa
-
+    pa = base_pa if winner == a_name else 1.0 - base_pa
     return winner, float(pa), reason
 
-# -----------------------------
-# Close-match auto-regeneration
-# -----------------------------
 def resolve_close_match(a_name, b_name, infos, name_to_id):
     a = infos[a_name]; b = infos[b_name]
     score_a, _ = composite_score(a)
@@ -406,63 +386,50 @@ def resolve_close_match(a_name, b_name, infos, name_to_id):
     if abs(score_a - score_b) >= CLOSE_MARGIN:
         return choose_with_tiebreakers(a_name, b_name, infos, name_to_id, base_pa, allow_upset=True)
 
-    # close → do bootstrap regenerations with light noise
+    # Bootstrap when close
     votes = {a_name: 0, b_name: 0}
     probs = []
-    reasons = []
     for _ in range(REGENERATIONS):
-        # jitter cloned infos
-        def jittered(ti: TeamInfo):
-            j_recent = np.clip(ti.recent_wr70 + np.random.normal(0, NOISE_STD), 0, 1)
-            j_group  = np.clip(ti.group_norm  + np.random.normal(0, NOISE_STD), 0, 1)
-            j_kda    = max(0.2, ti.kda + np.random.normal(0, NOISE_STD*40))
-            j_ti     = np.clip(ti.ti_pressure + np.random.normal(0, NOISE_STD), 0, 1.0)
-            j_meta   = np.clip(ti.meta_align  + np.random.normal(0, NOISE_STD), 0, 1.0)
-            j_rospen = np.clip(ti.roster_pen  + np.random.normal(0, NOISE_STD*0.5), 0, 0.2)
-            return TeamInfo(ti.name, j_recent, j_group, j_rospen, ti.k_avg, ti.d_avg, ti.a_avg, j_kda, j_ti, ti.ti_pressure_sum, j_meta, ti.roster)
-        ji = infos.copy()
-        ji[a_name] = jittered(a)
-        ji[b_name] = jittered(b)
-        sa,_ = composite_score(ji[a_name])
-        sb,_ = composite_score(ji[b_name])
+        def jit(t):
+            return TeamInfo(
+                t.name,
+                float(np.clip(t.recent_wr70 + np.random.normal(0, NOISE_STD), 0, 1)),
+                float(np.clip(t.group_norm  + np.random.normal(0, NOISE_STD), 0, 1)),
+                float(np.clip(t.roster_pen  + np.random.normal(0, NOISE_STD*0.5), 0, 0.2)),
+                t.k_avg, t.d_avg, t.a_avg,
+                max(0.2, t.kda + np.random.normal(0, NOISE_STD*40)),
+                float(np.clip(t.ti_pressure + np.random.normal(0, NOISE_STD), 0, 1)),
+                t.ti_pressure_sum,
+                float(np.clip(t.meta_align  + np.random.normal(0, NOISE_STD), 0, 1)),
+                t.roster
+            )
+        ji = dict(infos)
+        ji[a_name] = jit(a); ji[b_name] = jit(b)
+        sa,_ = composite_score(ji[a_name]); sb,_ = composite_score(ji[b_name])
         p = match_probability(sa, sb)
-        w, pw, why = choose_with_tiebreakers(a_name, b_name, ji, name_to_id, p, allow_upset=True)
-        votes[w] += 1
-        probs.append(pw)
-        reasons.append(why)
+        w, pw, _ = choose_with_tiebreakers(a_name, b_name, ji, name_to_id, p, allow_upset=True)
+        votes[w] += 1; probs.append(pw)
 
-    # majority
     winner = a_name if votes[a_name] >= votes[b_name] else b_name
-    # average prob weighted toward winning side
-    # compute mean prob of winner across samples where winner predicted
-    winner_probs = [probs[i] for i in range(len(probs)) if (reasons[i] and True)]  # keep all; already ~calibrated
-    mean_p = float(np.mean(winner_probs)) if winner_probs else (base_pa if winner==a_name else 1.0-base_pa)
-
-    return winner, mean_p, "close_regen"
+    win_p = float(np.mean([p for p in probs])) if probs else (base_pa if winner==a_name else 1.0-base_pa)
+    return winner, win_p, "close_regen"
 
 # -----------------------------
 # Bracket simulation (8 teams)
 # -----------------------------
-def simulate_bracket(teams, infos):
+def simulate_bracket(team_names, infos, pretty_names_to_ids):
     """
-    teams: list of 8 team names in bracket order (QF pairings)
-    returns:
-      winners dict by round, and full per-match rows
+    team_names: list of 8 pretty / official names (keys in infos)
     """
-    name_to_id = get_team_id_map()
+    name_to_id = {n: pretty_names_to_ids.get(n) for n in team_names}
 
     def run_match(a, b, round_name, per_win_bonuses):
-        # compute with possible per-win bonuses
-        # we add the MAIN_EVENT_WIN_BONUS * prior_wins to the composite score of each team
-        # by temporarily bumping their comp_recent piece (small, neutral injection)
-        base_a_score, parts_a = composite_score(infos[a])
-        base_b_score, parts_b = composite_score(infos[b])
-
-        score_a = base_a_score + per_win_bonuses.get(a, 0.0)
-        score_b = base_b_score + per_win_bonuses.get(b, 0.0)
-
+        base_a, _ = composite_score(infos[a])
+        base_b, _ = composite_score(infos[b])
+        score_a = base_a + per_win_bonuses.get(a, 0.0)
+        score_b = base_b + per_win_bonuses.get(b, 0.0)
         pa = match_probability(score_a, score_b)
-        # upset buffer & tiebreakers with auto-regeneration if close
+
         if abs(score_a - score_b) < CLOSE_MARGIN:
             winner, win_p, why = resolve_close_match(a, b, infos, name_to_id)
         else:
@@ -470,82 +437,61 @@ def simulate_bracket(teams, infos):
 
         loser = b if winner == a else a
         favored = a if score_a >= score_b else b
-
         row = {
             "round": round_name,
             "team_a": a, "team_b": b,
-            "score_a": round(score_a, 6), "score_b": round(score_b, 6),
-            "favored": favored, "winner": winner, "prob_winner": round(win_p, 2), "reason": why
+            "score_a": round(score_a,6), "score_b": round(score_b,6),
+            "favored": favored, "winner": winner, "prob_winner": round(win_p,2), "reason": why
         }
         return winner, loser, row
 
     rows = []
+    per_win = defaultdict(float)
 
-    # UB QF
-    per_win = defaultdict(float)  # per-win cumulative bonuses
-    qf_pairs = [(teams[0],teams[1]), (teams[2],teams[3]), (teams[4],teams[5]), (teams[6],teams[7])]
-    qf_winners = []
-    qf_losers = []
+    # UB QF (0-1, 2-3, 4-5, 6-7)
+    qf_pairs = [(team_names[0],team_names[1]), (team_names[2],team_names[3]),
+                (team_names[4],team_names[5]), (team_names[6],team_names[7])]
+    qf_winners=[]; qf_losers=[]
     for i,(a,b) in enumerate(qf_pairs, start=1):
-        w,l, r = run_match(a,b,f"UB QF{i}", per_win)
-        qf_winners.append(w)
-        qf_losers.append(l)
-        per_win[w] += MAIN_EVENT_WIN_BONUS
-        rows.append(r)
+        w,l,r = run_match(a,b,f"UB QF{i}", per_win)
+        qf_winners.append(w); qf_losers.append(l); per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # UB SF
-    sf_pairs = [(qf_winners[0], qf_winners[1]), (qf_winners[2], qf_winners[3])]
-    sf_winners = []
+    sf_pairs = [(qf_winners[0],qf_winners[1]), (qf_winners[2],qf_winners[3])]
+    sf_winners=[]
     for i,(a,b) in enumerate(sf_pairs, start=1):
-        w,l, r = run_match(a,b,f"UB SF{i}", per_win)
-        sf_winners.append(w)
-        per_win[w] += MAIN_EVENT_WIN_BONUS
-        rows.append(r)
+        w,l,r = run_match(a,b,f"UB SF{i}", per_win)
+        sf_winners.append(w); per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # UB Final
-    ub_final = (sf_winners[0], sf_winners[1])
-    w,l, r = run_match(ub_final[0], ub_final[1], "UB Final", per_win)
-    ub_champ = w; ub_finalist = l
-    per_win[w] += MAIN_EVENT_WIN_BONUS
-    rows.append(r)
+    w,l,r = run_match(sf_winners[0], sf_winners[1], "UB Final", per_win)
+    ub_champ = w; ub_finalist = l; per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
-    # LB Round 1
+    # LB R1
     lb_r1_pairs = [(qf_losers[0], qf_losers[1]), (qf_losers[2], qf_losers[3])]
     lb_r1_winners=[]
     for i,(a,b) in enumerate(lb_r1_pairs, start=1):
-        w,l, r = run_match(a,b,f"LB R1-{i}", per_win)
-        lb_r1_winners.append(w)
-        per_win[w] += MAIN_EVENT_WIN_BONUS
-        rows.append(r)
+        w,l,r = run_match(a,b,f"LB R1-{i}", per_win)
+        lb_r1_winners.append(w); per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # LB QF
     lb_qf_pairs = [(lb_r1_winners[0], sf_winners[1]), (lb_r1_winners[1], sf_winners[0])]
     lb_qf_winners=[]
     for i,(a,b) in enumerate(lb_qf_pairs, start=1):
-        w,l, r = run_match(a,b,f"LB QF{i}", per_win)
-        lb_qf_winners.append(w)
-        per_win[w] += MAIN_EVENT_WIN_BONUS
-        rows.append(r)
+        w,l,r = run_match(a,b,f"LB QF{i}", per_win)
+        lb_qf_winners.append(w); per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # LB SF
-    lb_sf = (lb_qf_winners[0], lb_qf_winners[1])
-    w,l, r = run_match(lb_sf[0], lb_sf[1], "LB SF", per_win)
-    lb_finalist = w
-    per_win[w] += MAIN_EVENT_WIN_BONUS
-    rows.append(r)
+    w,l,r = run_match(lb_qf_winners[0], lb_qf_winners[1], "LB SF", per_win)
+    lb_finalist = w; per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # LB Final
-    lb_final = (lb_finalist, ub_finalist)
-    w,l, r = run_match(lb_final[0], lb_final[1], "LB Final", per_win)
-    grand_finalist = w
-    per_win[w] += MAIN_EVENT_WIN_BONUS
-    rows.append(r)
+    w,l,r = run_match(lb_finalist, ub_finalist, "LB Final", per_win)
+    grand_finalist = w; per_win[w]+=MAIN_EVENT_WIN_BONUS; rows.append(r)
 
     # Grand Final
-    gf = (ub_champ, grand_finalist)
-    w,l, r = run_match(gf[0], gf[1], "Grand Final", per_win)
-    champion = w
-    rows.append(r)
+    w,l,r = run_match(ub_champ, grand_finalist, "Grand Final", per_win)
+    champion = w; rows.append(r)
 
     return {
         "UB QF Winners": qf_winners,
@@ -559,105 +505,69 @@ def simulate_bracket(teams, infos):
     }, rows
 
 # -----------------------------
-# Visualization helpers
+# Visuals
 # -----------------------------
 def plot_scores_bar(df):
     fig = plt.figure(figsize=(8,4.5))
     s = df.sort_values("score", ascending=False)
     plt.bar(s["team"], s["score"])
-    plt.xticks(rotation=30, ha="right")
-    plt.ylabel("Composite Score")
-    plt.tight_layout()
-    plt.savefig("bracket_scores.png", dpi=200)
-    plt.close(fig)
+    plt.xticks(rotation=30, ha="right"); plt.ylabel("Composite Score")
+    plt.tight_layout(); plt.savefig("bracket_scores.png", dpi=200); plt.close(fig)
 
 def plot_kda_heatmap(df):
-    # robust: ensure float and no objects
     hm = df[["k_avg","d_avg","a_avg","kda"]].astype(float).values
     fig = plt.figure(figsize=(6,3.6))
-    plt.imshow(hm, aspect="auto")
-    plt.yticks(ticks=np.arange(len(df)), labels=df["team"].tolist())
-    plt.xticks(ticks=[0,1,2,3], labels=["K","D","A","KDA"])
-    plt.colorbar()
-    plt.tight_layout()
-    plt.savefig("kda_heatmap.png", dpi=200)
-    plt.close(fig)
+    plt.imshow(hm, aspect="auto"); plt.yticks(range(len(df)), df["team"].tolist())
+    plt.xticks([0,1,2,3], ["K","D","A","KDA"]); plt.colorbar()
+    plt.tight_layout(); plt.savefig("kda_heatmap.png", dpi=200); plt.close(fig)
 
-def draw_bracket_tree(teams, bracket_rows):
-    """
-    Simple DAG bracket visualization using networkx -> positions by round index.
-    """
+def draw_bracket_tree(bracket_rows):
     G = nx.DiGraph()
-    # Collect nodes per round in chronological order:
-    rounds = []
-    for r in ["UB QF1","UB QF2","UB QF3","UB QF4",
-              "UB SF1","UB SF2","UB Final",
-              "LB R1-1","LB R1-2","LB QF1","LB QF2","LB SF","LB Final",
-              "Grand Final"]:
-        rounds.append(r)
-
+    order = ["UB QF1","UB QF2","UB QF3","UB QF4","UB SF1","UB SF2","UB Final",
+             "LB R1-1","LB R1-2","LB QF1","LB QF2","LB SF","LB Final","Grand Final"]
     nodes_by_round = defaultdict(list)
-    for row in bracket_rows:
-        r = row["round"]
-        a = f'{r}:{row["team_a"]}'
-        b = f'{r}:{row["team_b"]}'
-        w = f'{r}:WIN {row["winner"]}'
-        for n in [a,b,w]:
+    for r in bracket_rows:
+        rn = r["round"]; a=f'{rn}:{r["team_a"]}'; b=f'{rn}:{r["team_b"]}'; w=f'{rn}:WIN {r["winner"]}'
+        for n in (a,b,w):
             if n not in G: G.add_node(n)
-        nodes_by_round[r].extend([a,b,w])
-        # connect a->w and b->w
-        G.add_edge(a, w)
-        G.add_edge(b, w)
-
-    # positions
-    xstep = 2.0
-    ystep = 0.8
-    pos = {}
-    for i,r in enumerate(rounds):
-        rr = nodes_by_round.get(r, [])
-        # stack vertically
+        nodes_by_round[rn].extend([a,b,w]); G.add_edge(a,w); G.add_edge(b,w)
+    pos = {}; xstep=2.0; ystep=0.8
+    for i,rn in enumerate(order):
+        rr = nodes_by_round.get(rn, [])
         for j,n in enumerate(rr):
-            pos[n] = (i*xstep, j*ystep)
-
-    fig = plt.figure(figsize=(12,6))
+            pos[n]=(i*xstep, j*ystep)
+    fig=plt.figure(figsize=(12,6))
     nx.draw(G, pos, with_labels=False, node_size=300, arrows=False)
-    # add labels cleaner
     for n,(x,y) in pos.items():
         lbl = n.split(":",1)[1]
-        plt.text(x, y, lbl, fontsize=8, ha="center", va="center")
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("bracket_tree.png", dpi=200)
-    plt.close(fig)
+        plt.text(x,y,lbl,fontsize=8,ha="center",va="center")
+    plt.axis("off"); plt.tight_layout(); plt.savefig("bracket_tree.png", dpi=200); plt.close(fig)
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
-    # Bracket teams (8)
-    # If you pipe matchups/teams via input.txt, we'll parse; otherwise default to your 8 known teams
-    input_text = sys.stdin.read().strip()
-    parsed_teams = []
-    if input_text:
-        # collect any words between lines; accept either "Team A vs Team B" or just team list
-        for line in input_text.splitlines():
-            line = line.strip()
-            if not line: continue
-            if " vs " in line.lower():
-                parts = [p.strip() for p in line.split("vs")]
-                parsed_teams.extend(parts)
-            else:
-                parsed_teams.append(line.strip())
-    parsed_teams = [t for t in parsed_teams if t]
+    # Parse input (supports "A vs B" lines or plain team lines; strips records like ": 4-1" or "(2-3)")
+    raw = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+    parsed = []
+    for ln in raw:
+        if " vs " in ln.lower():
+            # split on 'vs' (case-insensitive), sanitize each
+            parts = re.split(r'\s+vs\s+', ln, flags=re.IGNORECASE)
+            parsed.extend([sanitize_team_name(p) for p in parts if p.strip()])
+        else:
+            parsed.append(sanitize_team_name(ln))
 
-    # Deduplicate while preserving order
-    seen = set(); teams = []
-    for t in parsed_teams:
-        if t not in seen:
-            teams.append(t); seen.add(t)
+    # Dedup by canonical form, preserve order
+    seen=set(); teams=[]
+    for t in parsed:
+        c = canonicalize(t)
+        if c not in seen:
+            seen.add(c); teams.append(t)
 
+    # Ensure exactly 8 teams
     if len(teams) < 8:
-        # Default 8 (based on your earlier runs)
+        # Fallback default 8 (you can adjust)
         teams = [
             "Xtreme Gaming",
             "Tundra Esports",
@@ -668,17 +578,30 @@ def main():
             "BetBoom Team",
             "Nigma Galaxy"
         ]
+    else:
+        teams = teams[:8]
 
-    # Fetch infos
-    print("Fetching OpenDota hero ID map & meta…", flush=True)
-    infos = team_infos(teams)
+    # Build canonical maps once
+    canon_to_id, canon_to_official = build_canonical_maps()
 
-    # Assemble table
-    rows = []
-    for nm in teams:
-        ti = infos[nm]
-        score, parts = composite_score(ti)
-        rows.append({
+    # Convert the 8 display names to **official** OpenDota names when possible
+    pretty_teams = []
+    pretty_name_to_id = {}
+    for t in teams:
+        c = canonicalize(t)
+        tid = best_match_id(c, canon_to_id)
+        pretty = pretty_official(c, canon_to_official, t)
+        pretty_teams.append(pretty)
+        pretty_name_to_id[pretty] = tid
+
+    print("Fetching OpenDota data…", flush=True)
+    infos = team_infos(pretty_teams, canon_to_id, canon_to_official)
+
+    # Build summary table
+    out_rows=[]
+    for nm in pretty_teams:
+        ti = infos[nm]; sc, parts = composite_score(ti)
+        out_rows.append({
             "team": nm,
             "recent_wr70": round(ti.recent_wr70,6),
             "group": round(ti.group_norm,3),
@@ -697,48 +620,37 @@ def main():
             "comp_ti":     round(parts["comp_ti"],6),
             "comp_meta":   round(parts["comp_meta"],6),
             "comp_falcons": round(parts["comp_falcons"],6),
-            "score": round(score,6),
+            "score": round(sc,6),
             "roster": ", ".join(ti.roster) if ti.roster else "(no current snapshot available)"
         })
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(out_rows)
 
     # Visuals
-    try:
-        plot_scores_bar(df)
-    except Exception as e:
-        print(f"[warn] Failed to create bar chart: {e}")
-    try:
-        plot_kda_heatmap(df)
-    except Exception as e:
-        print(f"[warn] Failed to create KDA heatmap: {e}")
+    try: plot_scores_bar(df)
+    except Exception as e: print(f"[warn] bar chart failed: {e}")
+    try: plot_kda_heatmap(df)
+    except Exception as e: print(f"[warn] heatmap failed: {e}")
 
-    # Bracket simulation
-    bracket, match_rows = simulate_bracket(teams, infos)
+    # Bracket simulation with **official names**
+    bracket, match_rows = simulate_bracket(pretty_teams, infos, pretty_name_to_id)
 
-    # Per-round CSV for debugging & fantasy tool
-    pr_df = pd.DataFrame(match_rows)
-    pr_df.to_csv("bracket_rounds.csv", index=False)
+    # Per-round CSV
+    pd.DataFrame(match_rows).to_csv("bracket_rounds.csv", index=False)
 
     # Bracket tree
-    try:
-        draw_bracket_tree(teams, match_rows)
-    except Exception as e:
-        print(f"[warn] Failed to create bracket tree: {e}")
+    try: draw_bracket_tree(match_rows)
+    except Exception as e: print(f"[warn] bracket tree failed: {e}")
 
-    # Markdown output
+    # Markdown report
     md = []
     md.append("# TI25 Full Bracket Prediction\n")
-    # Team table
     show_cols = ["team","recent_wr70","group","pen","k_avg","d_avg","a_avg","kda",
                  "ti_pressure","ti_pressure_sum","meta_align",
                  "comp_recent","comp_group","comp_roster","comp_form","comp_ti","comp_meta","comp_falcons","score"]
     md.append(df[show_cols].to_markdown(index=False))
     md.append("\n### Rosters (OpenDota current-team snapshot)")
-    for nm in teams:
-        ro = df.loc[df["team"]==nm, "roster"].values[0]
-        md.append(f"- {nm}: {ro}")
-
+    for nm in pretty_teams:
+        md.append(f"- {nm}: {df.loc[df['team']==nm, 'roster'].values[0]}")
     md.append("\n## Bracket Results")
     md.append(f"UB QF Winners: {bracket['UB QF Winners']}")
     md.append(f"UB SF Winners: {bracket['UB SF Winners']}")
@@ -749,7 +661,6 @@ def main():
     md.append(f"LB Final Winner: {bracket['LB Final Winner']}\n")
     md.append(f"**Champion:** {bracket['Champion']}\n")
 
-    # Per-match probabilities section
     md.append("## Per-Match Probabilities & Scores")
     md.append("| Round | A | B | Score A | Score B | Favored | Winner | P(Winner) | Reason |")
     md.append("|:--|:--|:--|--:|--:|:--|:--|--:|:--|")
@@ -773,7 +684,7 @@ def main():
     md.append(f"Upset buffer active: underdog must have p > **{UPSET_BUFFER:.2f}** to upset.")
     md.append(f"Main-event per-win bonus per team: +**{MAIN_EVENT_WIN_BONUS:.5f}** added to score for subsequent rounds.\n")
 
-    with open("bracket_prediction.md","w", encoding="utf-8") as f:
+    with open("bracket_prediction.md","w",encoding="utf-8") as f:
         f.write("\n".join(md))
 
     print("[ok] Wrote bracket_prediction.md")
